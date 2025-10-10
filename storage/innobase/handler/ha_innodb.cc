@@ -9027,6 +9027,7 @@ int ha_innobase::write_row(uchar *record) /*!< in: a row in MySQL format */
     return intrinsic_table_write_row(record);
   }
 
+  // 获取当前事务对象
   trx_t *trx = thd_to_trx(m_user_thd);
 
   TrxInInnoDB trx_in_innodb(trx);
@@ -9097,6 +9098,7 @@ int ha_innobase::write_row(uchar *record) /*!< in: a row in MySQL format */
     build_template(true);
   }
 
+  //进入InnoDB并发控制
   error = innobase_srv_conc_enter_innodb(m_prebuilt);
 
   if (error != DB_SUCCESS) {

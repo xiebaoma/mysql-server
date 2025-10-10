@@ -850,6 +850,7 @@ void mtr_t::Command::execute() {
 
     write_log.m_left_to_write = len;
 
+    // 在全局log buffer 预留空间 
     auto handle = log_buffer_reserve(*log_sys, len);
 
     write_log.m_handle = handle;
@@ -864,6 +865,7 @@ void mtr_t::Command::execute() {
 
     DEBUG_SYNC_C("mtr_redo_before_add_dirty_blocks");
 
+    //将修改的页面加入flush list（标记为脏页）
     add_dirty_blocks_to_flush_list(handle.start_lsn, handle.end_lsn);
 
     log_buffer_close(*log_sys, handle);
@@ -877,6 +879,7 @@ void mtr_t::Command::execute() {
   }
 #endif /* !UNIV_HOTBACKUP */
 
+  // Release the latches and blocks used in the mini-transaction.
   release_all();
   release_resources();
 }

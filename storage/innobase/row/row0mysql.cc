@@ -1445,6 +1445,7 @@ static dberr_t row_insert_for_mysql_using_cursor(const byte *mysql_rec,
       break;
     }
 
+    // 插入聚簇索引或者二级索引
     if (index->is_clustered()) {
       err = row_ins_clust_index_entry(node->index, node->entry, thr, false);
     } else {

@@ -2764,6 +2764,7 @@ dberr_t btr_cur_optimistic_insert(
     return (err);
   }
 
+  // 检查页面是否有足够的空间
   ulint max_size = page_get_max_insert_size_after_reorganize(page, 1);
 
   if (page_has_garbage(page)) {

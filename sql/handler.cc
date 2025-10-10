@@ -8010,6 +8010,8 @@ int handler::ha_write_row(uchar *buf) {
   DBUG_EXECUTE_IF("inject_error_ha_write_row", return HA_ERR_INTERNAL_ERROR;);
   DBUG_EXECUTE_IF("simulate_storage_engine_out_of_memory",
                   return HA_ERR_SE_OUT_OF_MEMORY;);
+
+  //标记事务为读写事务
   mark_trx_read_write();
 
   DBUG_EXECUTE_IF(
@@ -8017,11 +8019,13 @@ int handler::ha_write_row(uchar *buf) {
       my_error(HA_ERR_CRASHED, MYF(ME_ERRORLOG), table_share->table_name.str);
       set_my_errno(HA_ERR_CRASHED); return HA_ERR_CRASHED;);
 
+  //性能监控点
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_WRITE_ROW, MAX_KEY, error,
                       { error = write_row(buf); })
 
   if (unlikely(error)) return error;
 
+  //记录binlog(用于复制)
   if (unlikely((error = binlog_log_row(table, nullptr, buf, log_func))))
     return error; /* purecov: inspected */
 

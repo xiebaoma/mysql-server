@@ -2233,6 +2233,11 @@ static bool log_writer_is_allowed_to_stop(log_t &log) {
   return log.write_lsn.load() == log_buffer_ready_for_write_lsn(log);
 }
 
+/**
+ *  将log buffer中的数据写入redo log文件
+ *  使用普通write()，不进行fsync
+ *  更新`write_lsn`，表示已写入文件的位置
+ */
 void log_writer(log_t *log_ptr) {
   ut_a(log_ptr != nullptr);
 
@@ -2498,6 +2503,10 @@ static void log_flush_low(log_t &log) {
   log_flush_update_stats(log);
 }
 
+/**
+ * 将log buffer中已写入文件的数据进行fsync，确保数据持久化到磁盘
+ *  更新`flushed_to_disk_lsn`，表示已持久化到磁盘的位置
+ */
 void log_flusher(log_t *log_ptr) {
   ut_a(log_ptr != nullptr);
 

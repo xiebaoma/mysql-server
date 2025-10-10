@@ -857,7 +857,7 @@ static void page_cur_insert_rec_write_log(
     rec_t *cursor_rec,   /*!< in: record the
                          cursor is pointing to */
     dict_index_t *index, /*!< in: record descriptor */
-    mtr_t *mtr)          /*!< in: mini-transaction handle */
+    mtr_t *mtr)          /*!< in: mini-transaction handle */ // mtr 在此处使用
 {
   ulint cur_rec_size;
   ulint extra_size;
