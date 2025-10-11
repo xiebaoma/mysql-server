@@ -919,13 +919,16 @@ static inline bool is_instant(const Alter_inplace_info *ha_alter_info) {
 @return whether it is necessary to rebuild the table */
 [[nodiscard]] static bool innobase_need_rebuild(
     const Alter_inplace_info *ha_alter_info) {
+  // 1. INSTANT DDL 永远不需要 rebuild
   if (is_instant(ha_alter_info)) {
     return (false);
   }
 
+  // 2. 过滤掉 InnoDB 不关心的操作
   Alter_inplace_info::HA_ALTER_FLAGS alter_inplace_flags =
       ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE);
 
+  // 3. 特殊处理 CHANGE_CREATE_OPTION
   if (alter_inplace_flags == Alter_inplace_info::CHANGE_CREATE_OPTION &&
       !(ha_alter_info->create_info->used_fields &
         (HA_CREATE_USED_ROW_FORMAT | HA_CREATE_USED_KEY_BLOCK_SIZE |
@@ -935,7 +938,8 @@ static inline bool is_instant(const Alter_inplace_info *ha_alter_info) {
     without rebuilding the table. */
     return (false);
   }
-
+  
+  // 4. 检查是否包含 REBUILD 标志
   return (!!(ha_alter_info->handler_flags & INNOBASE_ALTER_REBUILD));
 }
 
