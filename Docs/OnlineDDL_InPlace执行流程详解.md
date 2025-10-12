@@ -73,6 +73,7 @@ class Alter_inplace_info {
 ```
 
 **HA_ALTER_FLAGS** 定义了各种 ALTER 操作类型：
+
 - `ADD_INDEX`：添加普通索引
 - `DROP_INDEX`：删除索引
 - `ADD_UNIQUE_INDEX`：添加唯一索引
@@ -133,11 +134,13 @@ struct ha_innobase_inplace_ctx : public inplace_alter_handler_ctx {
 **文件**：`sql/sql_table.cc` (第 11930-12800 行)
 
 **主要职责**：
+
 1. 比较新旧表定义
 2. 设置 `HA_ALTER_FLAGS` 标志位
 3. 填充索引添加/删除缓冲区
 
 **核心逻辑**：
+
 ```cpp
 // 检测列的变化
 for (field in old_table->fields) {
@@ -170,6 +173,7 @@ for (key in old_key_info) {
 **InnoDB 实现**：`storage/innobase/handler/handler0alter.cc`
 
 **返回值**：
+
 - `HA_ALTER_INPLACE_NOT_SUPPORTED`：不支持，必须使用 COPY
 - `HA_ALTER_INPLACE_EXCLUSIVE_LOCK`：支持，但需要排他锁
 - `HA_ALTER_INPLACE_SHARED_LOCK`：支持，需要共享写锁（SNW）
@@ -177,6 +181,7 @@ for (key in old_key_info) {
 - `HA_ALTER_INPLACE_INSTANT`：支持即时算法
 
 **InnoDB 的判断逻辑**：
+
 ```cpp
 // 需要重建表的操作
 if (handler_flags & INNOBASE_ALTER_REBUILD) {
@@ -198,6 +203,7 @@ if (handler_flags & INNOBASE_ONLINE_CREATE) {
 **文件**：`storage/innobase/handler/handler0alter.cc`
 
 **主要职责**：
+
 1. 创建 `ha_innobase_inplace_ctx` 上下文
 2. 为新索引分配数据结构
 3. 为 online 操作分配 Row Log
@@ -242,6 +248,7 @@ if (ctx->need_rebuild() && ctx->online) {
 ```
 
 **Row Log 结构**：
+
 - 每个正在创建的索引都有一个 row log
 - Row log 记录该索引上的 INSERT/UPDATE/DELETE 操作
 - 使用循环缓冲区，必要时写入磁盘临时文件
@@ -294,12 +301,14 @@ dberr_t Loader::scan_and_build_indexes() {
 ```
 
 **Builder 机制**：
+
 - 为每个新索引创建一个 `ddl::Builder`
 - Builder 从游标读取记录，提取索引键值
 - 将键值写入临时排序文件
 - 最后进行归并排序并批量插入 B-tree
 
 **并发 DML 的处理**：
+
 - 在扫描期间，其他会话可以执行 DML
 - DML 操作被拦截并记录到 Row Log
 
@@ -475,7 +484,32 @@ Row Log 是 Online DDL 的核心机制，值得单独详细说明。
 
 在 Online DDL 执行期间：
 - 允许并发 DML（INSERT/UPDATE/DELETE）
+
 - 这些 DML 操作不能直接修改正在构建的索引（因为索引还不完整）
+
+  ```
+  1️⃣ 场景区分
+  情况 A：DDL 不修改索引（如添加普通列）
+  
+  并发 DML 可以直接修改页
+  
+  DML 提交时就写入 Buffer Pool 和 redo log
+  
+  这时候说 “DML 不用等 DDL 完成” 是成立的
+  
+  情况 B：DDL 修改索引（如修改主键、添加唯一索引）
+  
+  并发 DML 不能直接修改原始页
+  
+  DML 会被 捕获到 DDL 内部的 row log
+  
+  等 DDL 完成索引重建后，再重放 DML
+  
+  这时候说 “DML 不用等 DDL 完成” 就不成立了
+  ```
+
+  
+
 - Row Log 记录下这些操作，等索引构建完成后再应用
 
 ### 5.2 Row Log 的结构
@@ -559,6 +593,7 @@ if (dict_index_get_online_status(index) == ONLINE_INDEX_CREATION) {
 **调用时机**：在 `commit_inplace_alter_table()` 中
 
 **流程**：
+
 1. 升级到排他锁，阻止新的 DML
 2. 从 row log 读取记录
 3. 应用每条记录（INSERT/DELETE）
@@ -566,6 +601,7 @@ if (dict_index_get_online_status(index) == ONLINE_INDEX_CREATION) {
 5. 释放锁
 
 **伪代码**：
+
 ```cpp
 row_log_apply() {
   // 1. 获取排他锁
@@ -611,6 +647,7 @@ MySQL 使用 Metadata Lock (MDL) 来保护表结构：
 - `MDL_EXCLUSIVE`：排他锁
 
 **Online DDL 的锁策略**：
+
 ```cpp
 // 初始：MDL_SHARED_UPGRADABLE
 // 允许并发读写
