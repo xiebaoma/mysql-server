@@ -8019,7 +8019,7 @@ int handler::ha_write_row(uchar *buf) {
       my_error(HA_ERR_CRASHED, MYF(ME_ERRORLOG), table_share->table_name.str);
       set_my_errno(HA_ERR_CRASHED); return HA_ERR_CRASHED;);
 
-  //性能监控点
+  //性能监控点，调用引擎接口
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_WRITE_ROW, MAX_KEY, error,
                       { error = write_row(buf); })
 
