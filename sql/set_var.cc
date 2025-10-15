@@ -1424,6 +1424,8 @@ int sql_set_variables(THD *thd, List<set_var_base> *var_list, bool opened) {
         thd->optimizer_switch_flag(OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER));
 
     Prepared_stmt_arena_holder ps_arena_holder(thd);
+
+    //step 1: check all variables
     while ((var = it++)) {
       if ((error = var->resolve(thd))) goto err;
     }
@@ -1437,11 +1439,14 @@ int sql_set_variables(THD *thd, List<set_var_base> *var_list, bool opened) {
   }
   thd->lex->set_exec_started();
   it.rewind();
+
+  //step 2: check that all variables
   while ((var = it++)) {
     if ((error = var->check(thd))) goto err;
   }
   if ((error = thd->is_error())) goto err;
 
+  //step 3: update all variables
   it.rewind();
   while ((var = it++)) {
     if ((error = var->update(thd)))  // Returns 0, -1 or 1

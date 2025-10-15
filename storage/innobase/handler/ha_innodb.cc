@@ -21886,17 +21886,20 @@ static void innodb_redo_log_capacity_update(THD *thd, SYS_VAR *, void *,
     return;
   }
 
+  //更新全局变量
   srv_redo_log_capacity = new_value;
 
   if (new_value == srv_redo_log_capacity_used) {
     return;
   }
 
+  //更新当前使用的日志容量
   srv_redo_log_capacity_used = new_value;
 
   ib::info(ER_IB_MSG_LOG_FILES_CAPACITY_CHANGED,
            srv_redo_log_capacity_used / MB);
 
+  //调整日志文件大小
   log_files_resize_requested(*log_sys);
 
   if (!log_sys->concurrency_margin_is_safe.load()) {
