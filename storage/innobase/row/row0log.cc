@@ -28,6 +28,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 /** @file row/row0log.cc
  Modification log for online index creation and online table rebuild
 
+ onDDL 缓存DML
+
  Created 2011-05-26 Marko Makela
  *******************************************************/
 

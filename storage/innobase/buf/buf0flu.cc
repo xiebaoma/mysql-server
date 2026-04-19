@@ -1249,6 +1249,7 @@ static void buf_flush_write_block_low(buf_page_t *bpage, buf_flush_t flush_type,
       break;
   }
 
+  //刷脏前先写如double write
   dberr_t err = dblwr::write(flush_type, bpage, sync);
 
   ut_a(err == DB_SUCCESS || err == DB_TABLESPACE_DELETED);

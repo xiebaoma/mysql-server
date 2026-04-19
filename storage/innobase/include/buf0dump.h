@@ -27,6 +27,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 /** @file include/buf0dump.h
  Implements a buffer pool dump/load.
+ 
+ 这个 dump 是将内存中的脏页导出，重启的时候可以预热 buffer pool
 
  Created April 08, 2011 Vasil Dimov
  *******************************************************/
