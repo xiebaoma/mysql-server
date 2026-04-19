@@ -1711,8 +1711,10 @@ dberr_t row_insert_for_mysql(const byte *mysql_rec, row_prebuilt_t *prebuilt) {
   relaxed including locking of table, transaction handling, etc.
   Use direct cursor interface for inserting to intrinsic tables. */
   if (prebuilt->table->is_intrinsic()) {
+    //内部表快速插入
     return (row_insert_for_mysql_using_cursor(mysql_rec, prebuilt));
   } else {
+    //普通表临时插入
     return (row_insert_for_mysql_using_ins_graph(mysql_rec, prebuilt));
   }
 }

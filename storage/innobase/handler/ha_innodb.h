@@ -89,8 +89,10 @@ class ha_innobase : public handler {
   ha_innobase(handlerton *hton, TABLE_SHARE *table_arg);
   ~ha_innobase() override = default;
 
+  //得到合适的 row formt
   row_type get_real_row_type(const HA_CREATE_INFO *create_info) const override;
 
+  // "InnoDB"
   const char *table_type() const override;
 
   enum ha_key_alg get_default_index_algorithm() const override {
@@ -130,6 +132,7 @@ class ha_innobase : public handler {
 
   longlong get_memory_buffer_size() const override;
 
+  //写入一行
   int write_row(uchar *buf) override;
 
   int update_row(const uchar *old_data, uchar *new_data) override;

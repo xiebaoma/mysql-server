@@ -2702,6 +2702,7 @@ detect this and will eventually quit sooner. */
   use of the shared data dictionary, locking, or even a transaction.
   In short, these are not ACID tables at all, just temporary data stored
   and manipulated during a larger process.*/
+  //临时表
   bool is_intrinsic() const {
     if (flags2 & DICT_TF2_INTRINSIC) {
       ut_ad(is_temporary());
