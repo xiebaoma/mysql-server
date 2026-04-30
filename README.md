@@ -23,7 +23,7 @@ log-error=/home/xiebaoma.xbm/mysql-server/local/run/error.log
 port=54000
 
 
-./local/mysql/bin/mysqld --defaults-file="$PWD/local/mysql/conf/my.cnf" --initialize-insecure
-./local/mysql/bin/mysqld --defaults-file="$PWD/local/mysql/conf/my.cnf" --daemonize
+./build-local/bin/mysqld --defaults-file="$PWD/local/mysql/conf/my.cnf" --initialize-insecure
+./build-local/bin/mysqld --defaults-file="$PWD/local/mysql/conf/my.cnf" --daemonize
 
-./local/mysql/bin/mysql -uroot -S "$PWD/local/run/mysql.sock"
+./build-local/bin/mysql -uroot -S "$PWD/local/run/mysql.sock"
