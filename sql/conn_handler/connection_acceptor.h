@@ -1,33 +1,7 @@
-/*
-   Copyright (c) 2013, 2025, Oracle and/or its affiliates.
+#pragma once
 
-   This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License, version 2.0,
-   as published by the Free Software Foundation.
-
-   This program is designed to work with certain software (including
-   but not limited to OpenSSL) that is licensed under separate terms,
-   as designated in a particular file or component or in included license
-   documentation.  The authors of MySQL hereby grant you an additional
-   permission to link the program and your derivative works with the
-   separately licensed software that they have either included with
-   the program or referenced in the documentation.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License, version 2.0, for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
-*/
-
-#ifndef CONNECTION_ACCEPTOR_INCLUDED
-#define CONNECTION_ACCEPTOR_INCLUDED
-
-#include "sql/conn_handler/channel_info.h"                // Channel_info
-#include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
+#include "sql/conn_handler/channel_info.h"
+#include "sql/conn_handler/connection_handler_manager.h"
 
 /**
   This class presents a generic interface to initialize and run
@@ -50,8 +24,6 @@ class Connection_acceptor {
 
   /**
     Initialize a connection acceptor.
-
-    @retval   return true if initialization failed, else false.
   */
   bool init_connection_acceptor() { return m_listener->setup_listener(); }
 
@@ -70,8 +42,6 @@ class Connection_acceptor {
   /**
      Spawn admin connection handler to accept admin connections from clients if
      create-admin-listener-thread is specified by user on commandline.
-
-    @return true unable to spawn admin connection handler thread else false.
   */
   bool check_and_spawn_admin_connection_handler_thread() const {
     return m_listener->check_and_spawn_admin_connection_handler_thread();
@@ -82,4 +52,3 @@ class Connection_acceptor {
   */
   void close_listener() { m_listener->close_listener(); }
 };
-#endif  // CONNECTION_ACCEPTOR_INCLUDED

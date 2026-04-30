@@ -1,30 +1,4 @@
-/*
-   Copyright (c) 2013, 2025, Oracle and/or its affiliates.
-
-   This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License, version 2.0,
-   as published by the Free Software Foundation.
-
-   This program is designed to work with certain software (including
-   but not limited to OpenSSL) that is licensed under separate terms,
-   as designated in a particular file or component or in included license
-   documentation.  The authors of MySQL hereby grant you an additional
-   permission to link the program and your derivative works with the
-   separately licensed software that they have either included with
-   the program or referenced in the documentation.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License, version 2.0, for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
-*/
-
-#ifndef SQL_CHANNEL_INFO_INCLUDED
-#define SQL_CHANNEL_INFO_INCLUDED
+#pragma once
 
 #include <sys/types.h>
 
@@ -50,8 +24,6 @@ class Channel_info {
  protected:
   /**
     Create and initialize a Vio object.
-
-    @returns a pointer to the initialized a vio object.
   */
   virtual Vio *create_and_init_vio() const = 0;
 
@@ -62,19 +34,11 @@ class Channel_info {
 
   /**
     Instantiate and initialize THD object and vio.
-
-    @returns pointer to initialized THD object.
-    @retval NULL THD object allocation fails.
   */
   virtual THD *create_thd();
 
   /**
     Send error back to the client and close the channel.
-
-    @param errorcode   code indicating type of error.
-    @param error       operating system specific error code.
-    @param senderror   true if the error need to be sent to
-                       client else false.
   */
   virtual void send_error_and_close_channel(uint errorcode, int error,
                                             bool senderror);
@@ -89,5 +53,3 @@ class Channel_info {
 
   virtual bool is_admin_connection() const { return false; }
 };
-
-#endif  // SQL_CHANNEL_INFO_INCLUDED.

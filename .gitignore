@@ -31,3 +31,4 @@ scalability_jobs_*
 .project
 .settings/
 
+.ccls-cache/
