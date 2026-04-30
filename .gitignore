@@ -17,6 +17,8 @@ TAGS_sorted_by_file
 .vscode/
 
 build/
+build-local/
+local/
 datatool/
 datatools/
 __pycache__/

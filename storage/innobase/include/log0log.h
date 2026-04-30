@@ -1,5 +1,4 @@
-#ifndef log0log_h
-#define log0log_h
+#pragma once
 
 #include "log0files_capacity.h"
 #include "log0files_dict.h"
@@ -208,5 +207,3 @@ void log_persist_initialized(log_t &log);
 void log_crash_safe_validate(log_t &log);
 
 #endif /* !UNIV_HOTBACKUP */
-
-#endif /* !log0log_h */
