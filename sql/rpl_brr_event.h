@@ -179,4 +179,21 @@ size_t max_encode_size_rollback(const Brr_ddl_rollback_event &ev);
 bool decode_brr_event(const unsigned char *buf, size_t buf_len,
                       mysql::binlog::event::Log_event_type type, Brr_event *out);
 
+// ==========================================================================
+//  Full-event encoding  (common header + body, used by source dump thread)
+// ==========================================================================
+
+/**
+ * Encode a complete BRR event (19-byte common header + body) into a
+ * wire-format buffer ready to be sent to the replica.
+ *
+ * @param ev           Event to encode (type determines the format).
+ * @param buf          Destination buffer.
+ * @param buf_size     Size of the destination buffer.
+ * @param do_checksum  Whether to append a CRC32 checksum.
+ * @return Number of bytes written, or 0 on error.
+ */
+size_t encode_full_brr_event(const Brr_event &ev, unsigned char *buf,
+                             size_t buf_size, bool do_checksum);
+
 #endif  // RPL_BRR_EVENT_H

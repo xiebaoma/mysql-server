@@ -24,8 +24,14 @@
 #include "sql/rpl_brr_event.h"
 
 #include <cstring>
+#include <ctime>
 
 #include "my_byteorder.h"
+#include "mysql/binlog/event/binlog_event.h"  // checksum_crc32, BINLOG_CHECKSUM_LEN
+#include "sql/log_event.h"                     // server_id, LOG_EVENT_HEADER_LEN
+
+using mysql::binlog::event::BINLOG_CHECKSUM_LEN;
+using mysql::binlog::event::checksum_crc32;
 
 using mysql::binlog::event::BRR_DDL_COMMIT_EVENT;
 using mysql::binlog::event::BRR_DDL_PREPARE_EVENT;
@@ -311,4 +317,57 @@ bool decode_brr_event(const unsigned char *buf, size_t buf_len,
     default:
       return false;
   }
+}
+
+// ==========================================================================
+//  Full-event encoding
+// ==========================================================================
+
+size_t encode_full_brr_event(const Brr_event &ev, unsigned char *buf,
+                             size_t buf_size, bool do_checksum) {
+  if (buf_size < LOG_EVENT_HEADER_LEN) return 0;
+
+  /* Encode body after the common header. */
+  unsigned char *body_buf = buf + LOG_EVENT_HEADER_LEN;
+  size_t body_size_limit = buf_size - LOG_EVENT_HEADER_LEN;
+  if (do_checksum && body_size_limit > BINLOG_CHECKSUM_LEN)
+    body_size_limit -= BINLOG_CHECKSUM_LEN;
+  else if (do_checksum)
+    return 0;  // buffer too small for checksum
+
+  size_t body_size = 0;
+  switch (ev.type) {
+    case BRR_DDL_PREPARE_EVENT:
+      body_size = encode_brr_prepare_event(ev.prepare, body_buf, body_size_limit);
+      break;
+    case BRR_DDL_COMMIT_EVENT:
+      body_size = encode_brr_commit_event(ev.commit, body_buf, body_size_limit);
+      break;
+    case BRR_DDL_ROLLBACK_EVENT:
+      body_size = encode_brr_rollback_event(ev.rollback, body_buf, body_size_limit);
+      break;
+    default:
+      return 0;
+  }
+  if (body_size == 0) return 0;
+
+  size_t event_len = LOG_EVENT_HEADER_LEN + body_size;
+  if (do_checksum) event_len += BINLOG_CHECKSUM_LEN;
+
+  /* Write the 19-byte common header. */
+  int4store(buf, 0);  // timestamp (0 = unused for BRR events)
+  buf[EVENT_TYPE_OFFSET] = static_cast<unsigned char>(ev.type);
+  int4store(buf + SERVER_ID_OFFSET, server_id);
+  int4store(buf + EVENT_LEN_OFFSET, static_cast<uint32_t>(event_len));
+  int4store(buf + LOG_POS_OFFSET, 0);  // log_pos = 0 (non-binlog event)
+  int2store(buf + FLAGS_OFFSET, 0);
+
+  /* Append checksum if requested. */
+  if (do_checksum) {
+    uint32_t crc = checksum_crc32(0L, nullptr, 0);
+    crc = checksum_crc32(crc, buf, event_len - BINLOG_CHECKSUM_LEN);
+    int4store(buf + event_len - BINLOG_CHECKSUM_LEN, crc);
+  }
+
+  return event_len;
 }
