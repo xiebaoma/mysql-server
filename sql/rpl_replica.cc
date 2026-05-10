@@ -128,6 +128,7 @@
 #include "sql/rpl_applier_reader.h"
 #include "sql/rpl_async_conn_failover.h"
 #include "sql/rpl_async_conn_failover_configuration_propagation.h"
+#include "sql/rpl_brr_event.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_group_replication.h"
 #include "sql/rpl_gtid.h"
@@ -4149,6 +4150,10 @@ static int request_dump(THD *thd, MYSQL *mysql, MYSQL_RPL *rpl, Master_info *mi,
   */
   uint binlog_flags = 0;
   binlog_flags |= USE_HEARTBEAT_EVENT_V2;
+  if (opt_binlog_realtime_replication) {
+    binlog_flags |= BRR_CAPABILITY_FLAG;
+  }
+  mi->brr_enabled = opt_binlog_realtime_replication;
 
   *suppress_warnings = false;
   if (RUN_HOOK(binlog_relay_io, before_request_transmit,

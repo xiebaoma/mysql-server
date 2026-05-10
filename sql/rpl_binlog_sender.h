@@ -72,6 +72,11 @@ class Binlog_sender {
     m_prev_event_type = type;
   }
 
+  /// Returns true if BRR capability was negotiated with the replica.
+  bool is_brr_capability_negotiated() const {
+    return m_brr_capability_negotiated;
+  }
+
  private:
   /**
     Checks whether thread should continue awaiting new events
@@ -180,6 +185,8 @@ class Binlog_sender {
   const static float PACKET_SHRINK_FACTOR;
 
   uint32 m_flag;
+  /// True if both source and replica have BRR enabled.
+  bool m_brr_capability_negotiated{false};
   /*
     It is true if any plugin requires to observe the transmission for each
     event. And HOOKs(reserve_header, before_send and after_send) are called when

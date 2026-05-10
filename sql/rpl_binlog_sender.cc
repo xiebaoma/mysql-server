@@ -22,7 +22,9 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "sql/rpl_binlog_sender.h"
+
 #include "mysql/binlog/event/codecs/factory.h"
+#include "sql/rpl_brr_event.h"
 
 #include <stdio.h>
 #include <algorithm>
@@ -301,6 +303,14 @@ void Binlog_sender::init() {
       return;
     }
   }
+
+  /*
+    BRR capability negotiation: enabled only when both the replica requested
+    it (via the BRR_CAPABILITY_FLAG in the dump request flags) and the source
+    has binlog_realtime_replication turned on.
+  */
+  m_brr_capability_negotiated =
+      (m_flag & BRR_CAPABILITY_FLAG) && opt_binlog_realtime_replication;
 
   if (check_start_file()) return;
 
