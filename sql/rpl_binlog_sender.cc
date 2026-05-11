@@ -22,7 +22,9 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "sql/rpl_binlog_sender.h"
+
 #include "mysql/binlog/event/codecs/factory.h"
+#include "sql/rpl_brr_event.h"
 
 #include <stdio.h>
 #include <algorithm>
@@ -301,6 +303,14 @@ void Binlog_sender::init() {
       return;
     }
   }
+
+  /*
+    BRR capability negotiation: enabled only when both the replica requested
+    it (via the BRR_CAPABILITY_FLAG in the dump request flags) and the source
+    has binlog_realtime_replication turned on.
+  */
+  m_brr_capability_negotiated =
+      (m_flag & BRR_CAPABILITY_FLAG) && opt_binlog_realtime_replication;
 
   if (check_start_file()) return;
 
@@ -583,6 +593,9 @@ int Binlog_sender::send_events(File_reader &reader, my_off_t end_pos) {
     uint32 event_len = 0;
 
     if (unlikely(thd->killed)) return 1;
+
+    /* Send any queued BRR events before the next binlog event. */
+    if (m_brr_capability_negotiated && flush_brr_queue()) return 1;
 
     if (unlikely(read_event(reader, &event_ptr, &event_len))) return 1;
 
@@ -1526,4 +1539,92 @@ void Binlog_sender::calc_shrink_buffer_size(size_t current_size) {
                static_cast<double>(current_size * PACKET_SHRINK_FACTOR)));
 
   m_new_shrink_size = ALIGN_SIZE(new_size);
+}
+
+// ==========================================================================
+//  BRR event sending
+// ==========================================================================
+
+bool Binlog_sender::enqueue_brr_event(const Brr_event &ev) {
+  if (!m_brr_capability_negotiated) return false;
+
+  size_t max_size = 0;
+  switch (ev.type) {
+    case BRR_DDL_PREPARE_EVENT:
+      max_size = max_encode_size_prepare(ev.prepare);
+      break;
+    case BRR_DDL_COMMIT_EVENT:
+      max_size = max_encode_size_commit(ev.commit);
+      break;
+    case BRR_DDL_ROLLBACK_EVENT:
+      max_size = max_encode_size_rollback(ev.rollback);
+      break;
+    default:
+      return false;
+  }
+  max_size += LOG_EVENT_HEADER_LEN + BINLOG_CHECKSUM_LEN;
+
+  std::vector<unsigned char> buffer(max_size);
+  size_t ev_size = encode_full_brr_event(ev, buffer.data(), max_size,
+                                         event_checksum_on());
+  if (ev_size == 0) return false;
+  buffer.resize(ev_size);
+
+  {
+    std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+    if (m_brr_event_queue.size() >= MAX_BRR_SEND_QUEUE_SIZE) {
+      ++m_brr_queue_rejected_count;
+      return false;
+    }
+    m_brr_event_queue.push(std::move(buffer));
+  }
+  return true;
+}
+
+int Binlog_sender::flush_brr_queue() {
+  std::vector<unsigned char> entry;
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+      if (m_brr_event_queue.empty()) return 0;
+      entry = std::move(m_brr_event_queue.front());
+      m_brr_event_queue.pop();
+    }
+
+    if (reset_transmit_packet(0, entry.size())) return 1;
+    size_t offset = m_packet.length();
+    m_packet.length(offset + entry.size());
+    memcpy(pointer_cast<unsigned char *>(m_packet.ptr()) + offset, entry.data(),
+           entry.size());
+    if (send_packet_and_flush()) return 1;
+  }
+}
+
+int Binlog_sender::send_brr_event_packet(const Brr_event &ev) {
+  size_t max_size = 0;
+  switch (ev.type) {
+    case BRR_DDL_PREPARE_EVENT:
+      max_size = max_encode_size_prepare(ev.prepare);
+      break;
+    case BRR_DDL_COMMIT_EVENT:
+      max_size = max_encode_size_commit(ev.commit);
+      break;
+    case BRR_DDL_ROLLBACK_EVENT:
+      max_size = max_encode_size_rollback(ev.rollback);
+      break;
+    default:
+      return 1;
+  }
+  max_size += LOG_EVENT_HEADER_LEN + BINLOG_CHECKSUM_LEN;
+
+  if (reset_transmit_packet(0, max_size)) return 1;
+
+  size_t offset = m_packet.length();
+  size_t ev_size = encode_full_brr_event(
+      ev, pointer_cast<unsigned char *>(m_packet.ptr()) + offset,
+      m_packet.alloced_length() - offset, event_checksum_on());
+  if (ev_size == 0) return 1;
+  m_packet.length(offset + ev_size);
+
+  return send_packet_and_flush();
 }

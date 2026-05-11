@@ -128,6 +128,7 @@
 #include "sql/rpl_applier_reader.h"
 #include "sql/rpl_async_conn_failover.h"
 #include "sql/rpl_async_conn_failover_configuration_propagation.h"
+#include "sql/rpl_brr_event.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_group_replication.h"
 #include "sql/rpl_gtid.h"
@@ -4149,6 +4150,10 @@ static int request_dump(THD *thd, MYSQL *mysql, MYSQL_RPL *rpl, Master_info *mi,
   */
   uint binlog_flags = 0;
   binlog_flags |= USE_HEARTBEAT_EVENT_V2;
+  if (opt_binlog_realtime_replication) {
+    binlog_flags |= BRR_CAPABILITY_FLAG;
+  }
+  mi->brr_enabled = opt_binlog_realtime_replication;
 
   *suppress_warnings = false;
   if (RUN_HOOK(binlog_relay_io, before_request_transmit,
@@ -5594,6 +5599,64 @@ extern "C" void *handle_slave_io(void *arg) {
                      ER_THD(thd, ER_REPLICA_FATAL_ERROR),
                      "Failed to run 'after_read_event' hook");
           goto err;
+        }
+
+        /*
+         * BRR events are not written to the relay log.  Decode them,
+         * enqueue them into the in-memory BRR queue, and skip the
+         * normal queue_event() path.  The BRR worker will consume them
+         * later.
+         */
+        Log_event_type event_type = static_cast<Log_event_type>(
+            event_buf[EVENT_TYPE_OFFSET]);
+        if (Log_event_type_helper::is_brr_event(event_type)) {
+          if (!mi->brr_enabled) {
+            /* BRR not enabled on this replica — ignore and continue. */
+            continue;
+          }
+
+          /* Determine the agreed checksum algorithm. */
+          enum_binlog_checksum_alg checksum_alg =
+              mi->checksum_alg_before_fd != BINLOG_CHECKSUM_ALG_UNDEF
+                  ? mi->checksum_alg_before_fd
+                  : mi->rli->relay_log.relay_log_checksum_alg;
+          bool checksum_enabled =
+              (checksum_alg > BINLOG_CHECKSUM_ALG_OFF &&
+               checksum_alg < BINLOG_CHECKSUM_ALG_ENUM_END);
+
+          /* Verify CRC32 when checksums are enabled. */
+          if (checksum_enabled &&
+              Log_event_footer::event_checksum_test(
+                  const_cast<uchar *>(
+                      pointer_cast<const uchar *>(event_buf)),
+                  event_len, checksum_alg)) {
+            /* Checksum mismatch — discard the corrupted event.
+             * The source will send the normal GTID_EVENT + QUERY_EVENT
+             * which will be processed normally. */
+            continue;
+          }
+
+          /* Extract the body: skip the 19-byte common header, optionally
+           * strip the 4-byte CRC32 checksum at the end. */
+          const unsigned char *body =
+              pointer_cast<const unsigned char *>(event_buf +
+                                                  LOG_EVENT_HEADER_LEN);
+          size_t body_len = (event_len > LOG_EVENT_HEADER_LEN)
+                                ? event_len - LOG_EVENT_HEADER_LEN
+                                : 0;
+          if (checksum_enabled && body_len >= BINLOG_CHECKSUM_LEN)
+            body_len -= BINLOG_CHECKSUM_LEN;
+
+          Brr_event brr_ev;
+          if (!decode_brr_event(body, body_len, event_type, &brr_ev)) {
+            /* Decode failed — fall back to original relay-log DDL. */
+            continue;
+          }
+          if (!rli->m_brr_queue.enqueue(std::move(brr_ev))) {
+            /* Queue full — fall back to original relay-log DDL. */
+            continue;
+          }
+          continue;
         }
 
         /* XXX: 'synced' should be updated by queue_event to indicate

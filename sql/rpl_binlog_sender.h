@@ -24,9 +24,12 @@
 #ifndef DEFINED_RPL_BINLOG_SENDER
 #define DEFINED_RPL_BINLOG_SENDER
 
+#include <mutex>
+#include <queue>
 #include <string.h>
 #include <sys/types.h>
 #include <chrono>
+#include <vector>
 
 #include "my_inttypes.h"
 #include "my_io.h"
@@ -35,6 +38,7 @@
 #include "mysqld_error.h"  // ER_*
 #include "sql/binlog.h"    // LOG_INFO
 #include "sql/binlog_reader.h"
+#include "sql/rpl_brr_event.h"
 #include "sql/rpl_gtid.h"
 #include "sql/sql_error.h"  // Diagnostics_area
 
@@ -72,7 +76,26 @@ class Binlog_sender {
     m_prev_event_type = type;
   }
 
+  /// Returns true if BRR capability was negotiated with the replica.
+  bool is_brr_capability_negotiated() const {
+    return m_brr_capability_negotiated;
+  }
+
+  /**
+   * Enqueue a BRR event for sending.  Called by the source DDL hook from
+   * the session thread.  The event is encoded immediately and placed in
+   * the internal queue; the dump thread sends it at the next opportunity.
+   *
+   * @return true on success, false if encoding fails.
+   */
+  bool enqueue_brr_event(const Brr_event &ev);
+
  private:
+  /** Send all queued BRR events to the replica.  Called by the dump thread. */
+  int flush_brr_queue();
+
+  /** Encode and send a single BRR event over the network. */
+  int send_brr_event_packet(const Brr_event &ev);
   /**
     Checks whether thread should continue awaiting new events
     @param log_pos Last processed (sent) event id
@@ -180,6 +203,18 @@ class Binlog_sender {
   const static float PACKET_SHRINK_FACTOR;
 
   uint32 m_flag;
+  /// True if both source and replica have BRR enabled.
+  bool m_brr_capability_negotiated{false};
+
+  /// Queue of pre-encoded BRR events waiting to be sent.
+  /// Populated by the session thread (via enqueue_brr_event) and
+  /// drained by the dump thread (via flush_brr_queue).
+  static constexpr size_t MAX_BRR_SEND_QUEUE_SIZE = 64;
+  std::queue<std::vector<unsigned char>> m_brr_event_queue;
+  std::mutex m_brr_queue_mutex;
+  /// Number of enqueue attempts rejected due to queue-full.
+  uint64_t m_brr_queue_rejected_count{0};
+
   /*
     It is true if any plugin requires to observe the transmission for each
     event. And HOOKs(reserve_header, before_send and after_send) are called when

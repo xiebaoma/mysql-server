@@ -53,6 +53,7 @@
 #include "sql/log_event.h"     //Gtid_log_event
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
+#include "sql/rpl_brr_queue.h"   // Brr_queue
 #include "sql/rpl_gtid.h"         // Gtid_set
 #include "sql/rpl_info.h"         // Rpl_info
 #include "sql/rpl_mta_submode.h"  // enum_mts_parallel_type
@@ -1831,6 +1832,10 @@ class Relay_log_info : public Rpl_info {
     corrdinator's order manager.
    */
   Commit_order_manager *commit_order_mngr;
+
+  /// In-memory queue for BRR events.  Populated by the IO thread,
+  /// consumed by the BRR worker.  Not crash-safe — cleared on restart.
+  Brr_queue m_brr_queue;
 
   /**
     Delay slave SQL thread by this amount of seconds.

@@ -321,6 +321,12 @@ class Master_info : public Rpl_info {
 
   ulonglong last_heartbeat;
 
+  /// True if BRR is enabled on this replica channel.
+  /// Set from opt_binlog_realtime_replication at dump request time.
+  /// Whether the source actually sends BRR events is determined later
+  /// by inspecting the incoming event stream.
+  bool brr_enabled{false};
+
   Server_ids *ignore_server_ids;
 
   ulong master_id;
