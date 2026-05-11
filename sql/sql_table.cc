@@ -151,6 +151,8 @@
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
+#include "sql/rpl_brr_event.h"
+#include "sql/rpl_brr_source.h"
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_rli.h"  // rli_slave etc
 #include "sql/session_tracker.h"
@@ -243,6 +245,536 @@ handlerton *default_handlerton(THD *thd, const HA_CREATE_INFO &ci) {
 handlerton *requested_handlerton(THD *thd, const HA_CREATE_INFO &ci) {
   return is_engine_specified(ci) ? ci.db_type : default_handlerton(thd, ci);
 }
+
+enum class Brr_source_ddl_state {
+  INIT,
+  ELIGIBILITY_CHECK,
+  ELIGIBLE,
+  GTID_RESERVED,
+  PREPARE_SENT,
+  EXECUTING,
+  COMMIT_SENT,
+  ROLLBACK_SENT,
+  FALLBACK,
+  DONE
+};
+
+enum class Brr_source_fallback_reason {
+  NONE,
+  BRR_DISABLED,
+  NO_BRR_SENDER,
+  GTID_MODE_NOT_ON,
+  BINLOG_DISABLED,
+  UNSUPPORTED_SQL_COMMAND,
+  MULTI_TABLE_DDL,
+  TEMPORARY_TABLE,
+  SYSTEM_SCHEMA,
+  DD_TABLE,
+  NON_INNODB_TABLE,
+  PARTITION_TABLE,
+  FOREIGN_KEY_RELATED,
+  UNSUPPORTED_ALTER_FLAGS,
+  UNSUPPORTED_INPLACE_RESULT,
+  INSTANT_DDL,
+  COPY_DDL_NOT_ENABLED,
+  FULLTEXT_INDEX,
+  SPATIAL_INDEX,
+  FUNCTIONAL_INDEX,
+  GENERATED_COLUMN,
+  PRIMARY_KEY_CHANGE,
+  UNIQUE_INDEX,
+  RENAME_RELATED,
+  EXCLUSIVE_LOCK,
+  GTID_NOT_RESERVED,
+  PREPARE_SEND_FAILED,
+  COMMIT_SEND_FAILED,
+  ROLLBACK_SEND_FAILED,
+  GTID_PRE_GENERATE_FAILED,
+  GTID_NEXT_NOT_AUTOMATIC,
+  GTID_TAGGED_NOT_SUPPORTED,
+  GTID_MISMATCH,
+  ANOTHER_DDL_IN_FLIGHT,
+  UNSAFE_DDL_PHASE
+};
+
+std::atomic<uint64_t> brr_source_next_ddl_id{1};
+std::atomic<bool> brr_source_ddl_in_flight{false};
+
+/**
+  Source-side BRR context for one DDL statement.
+
+  This context is intentionally local to ALTER TABLE execution. It keeps BRR
+  eligibility, pre-generated GTID ownership, and source prepare/commit/rollback
+  event routing tied to one DDL statement.
+*/
+class Brr_source_ddl_context {
+ public:
+  ~Brr_source_ddl_context() { release_in_flight_slot(); }
+
+  void begin_eligibility(THD *thd, const Table_ref *table_list) {
+    assert(thd != nullptr);
+
+    m_state = Brr_source_ddl_state::ELIGIBILITY_CHECK;
+    m_fallback_reason = Brr_source_fallback_reason::NONE;
+    m_common.ddl_id = brr_source_next_ddl_id.fetch_add(1);
+    m_common.source_server_id = static_cast<uint32_t>(server_id);
+    memcpy(m_common.source_server_uuid, server_uuid, BRR_UUID_STRING_LENGTH);
+
+    if (table_list != nullptr) {
+      if (table_list->db != nullptr) m_schema_name.assign(table_list->db);
+      if (table_list->table_name != nullptr)
+        m_table_name.assign(table_list->table_name);
+    }
+
+    if (thd->query().str != nullptr)
+      m_query.assign(thd->query().str, thd->query().length);
+
+    if (!opt_binlog_realtime_replication) {
+      mark_fallback(Brr_source_fallback_reason::BRR_DISABLED);
+    } else if (!brr_source_has_registered_sender()) {
+      mark_fallback(Brr_source_fallback_reason::NO_BRR_SENDER);
+    } else if (global_gtid_mode.get() != Gtid_mode::ON) {
+      mark_fallback(Brr_source_fallback_reason::GTID_MODE_NOT_ON);
+    } else if (!mysql_bin_log.is_open() ||
+               !(thd->variables.option_bits & OPTION_BIN_LOG)) {
+      mark_fallback(Brr_source_fallback_reason::BINLOG_DISABLED);
+    }
+  }
+
+  void evaluate_inplace_add_index_candidate(
+      THD *thd, const Table_ref *table_list, TABLE *table,
+      Alter_inplace_info *ha_alter_info,
+      enum_alter_inplace_result inplace_supported) {
+    if (is_fallback()) return;
+
+    if (thd == nullptr || table_list == nullptr || table == nullptr ||
+        ha_alter_info == nullptr || ha_alter_info->alter_info == nullptr ||
+        ha_alter_info->create_info == nullptr) {
+      mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+      return;
+    }
+
+    Alter_info *alter_info = ha_alter_info->alter_info;
+    if (thd->lex->sql_command != SQLCOM_ALTER_TABLE) {
+      mark_fallback(Brr_source_fallback_reason::UNSUPPORTED_SQL_COMMAND);
+      return;
+    }
+
+    if (alter_info->requested_lock == Alter_info::ALTER_TABLE_LOCK_EXCLUSIVE) {
+      mark_fallback(Brr_source_fallback_reason::EXCLUSIVE_LOCK);
+      return;
+    }
+
+    if (table_list->next_global != nullptr) {
+      mark_fallback(Brr_source_fallback_reason::MULTI_TABLE_DDL);
+      return;
+    }
+
+    if (table->s == nullptr) {
+      mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+      return;
+    }
+
+    if (table->s->tmp_table != NO_TMP_TABLE) {
+      mark_fallback(Brr_source_fallback_reason::TEMPORARY_TABLE);
+      return;
+    }
+
+    if (is_system_schema(table_list->db)) {
+      mark_fallback(Brr_source_fallback_reason::SYSTEM_SCHEMA);
+      return;
+    }
+
+    if (table_list->table_name == nullptr) {
+      mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+      return;
+    }
+
+    if (dd::get_dictionary()->is_dd_table_name(table_list->db,
+                                               table_list->table_name)) {
+      mark_fallback(Brr_source_fallback_reason::DD_TABLE);
+      return;
+    }
+
+    if (table->s->db_type() == nullptr ||
+        table->s->db_type()->db_type != DB_TYPE_INNODB ||
+        ha_alter_info->create_info->db_type == nullptr ||
+        ha_alter_info->create_info->db_type->db_type != DB_TYPE_INNODB) {
+      mark_fallback(Brr_source_fallback_reason::NON_INNODB_TABLE);
+      return;
+    }
+
+    if (table->s->m_part_info != nullptr ||
+        ha_alter_info->modified_part_info != nullptr) {
+      mark_fallback(Brr_source_fallback_reason::PARTITION_TABLE);
+      return;
+    }
+
+    if (!is_supported_inplace_result(inplace_supported)) {
+      mark_fallback(inplace_supported == HA_ALTER_INPLACE_INSTANT
+                        ? Brr_source_fallback_reason::INSTANT_DDL
+                        : Brr_source_fallback_reason::
+                              UNSUPPORTED_INPLACE_RESULT);
+      return;
+    }
+
+    if (!is_supported_add_index_flags(ha_alter_info->handler_flags)) {
+      return;
+    }
+
+    if (!are_supported_added_indexes(ha_alter_info)) return;
+
+    m_ddl_type = static_cast<uint32_t>(thd->lex->sql_command);
+    m_ddl_algorithm = static_cast<uint32_t>(inplace_supported);
+    m_ddl_lock_type = static_cast<uint32_t>(alter_info->requested_lock);
+
+    m_state = Brr_source_ddl_state::ELIGIBLE;
+    if (!acquire_in_flight_slot()) return;
+    reserve_gtid_for_brr(thd);
+  }
+
+  void mark_copy_fallback() {
+    if (!is_fallback())
+      mark_fallback(Brr_source_fallback_reason::COPY_DDL_NOT_ENABLED);
+  }
+
+  void mark_gtid_reserved(int64_t gtid_gno) {
+    if (is_fallback()) return;
+
+    m_common.gtid_gno = gtid_gno;
+    m_state = Brr_source_ddl_state::GTID_RESERVED;
+  }
+
+  bool verify_original_binlog_gtid(THD *thd) {
+    if (!m_prepare_sent || is_fallback()) return false;
+    if (matches_reserved_gtid(thd)) return true;
+
+    mark_fallback(Brr_source_fallback_reason::GTID_MISMATCH);
+    return false;
+  }
+
+  void restore_gtid_next_after_brr(THD *thd) {
+    if (thd == nullptr || !has_reserved_gtid() || !thd->owned_gtid_is_empty())
+      return;
+
+    if (thd->variables.gtid_next.is_undefined() ||
+        (thd->variables.gtid_next.is_assigned() &&
+         thd->variables.gtid_next.gtid.sidno == m_reserved_sidno &&
+         thd->variables.gtid_next.gtid.gno == m_common.gtid_gno)) {
+      thd->variables.gtid_next.set_automatic();
+    }
+  }
+
+  void set_prepare_dependency_gtid_set(const std::string &gtid_set) {
+    m_prepare_dependency_gtid_set = gtid_set;
+  }
+
+  void set_commit_dependency_gtid_set(const std::string &gtid_set) {
+    m_commit_dependency_gtid_set = gtid_set;
+  }
+
+  void send_prepare_if_ready() {
+    if (!is_prepare_ready()) {
+      if (!is_fallback() && !m_prepare_sent)
+        mark_fallback(Brr_source_fallback_reason::GTID_NOT_RESERVED);
+      return;
+    }
+
+    Brr_event event;
+    event.type = mysql::binlog::event::BRR_DDL_PREPARE_EVENT;
+    event.prepare.common = m_common;
+    event.prepare.schema_name = m_schema_name;
+    event.prepare.table_name = m_table_name;
+    event.prepare.query = m_query;
+    event.prepare.ddl_type = m_ddl_type;
+    event.prepare.ddl_algorithm = m_ddl_algorithm;
+    event.prepare.ddl_lock_type = m_ddl_lock_type;
+    event.prepare.prepare_dependency_gtid_set = m_prepare_dependency_gtid_set;
+    event.prepare.session_variables = m_session_variables;
+
+    if (brr_source_enqueue_event(event) == 0) {
+      mark_fallback(Brr_source_fallback_reason::PREPARE_SEND_FAILED);
+      return;
+    }
+
+    m_prepare_sent = true;
+    m_state = Brr_source_ddl_state::PREPARE_SENT;
+  }
+
+  void mark_executing() {
+    if (m_prepare_sent && !is_fallback())
+      m_state = Brr_source_ddl_state::EXECUTING;
+  }
+
+  void send_commit_if_prepared() {
+    if (!m_prepare_sent || is_fallback()) return;
+
+    Brr_event event;
+    event.type = mysql::binlog::event::BRR_DDL_COMMIT_EVENT;
+    event.commit.common = m_common;
+    event.commit.commit_dependency_gtid_set = m_commit_dependency_gtid_set;
+    event.commit.source_result = 1;
+
+    if (brr_source_enqueue_event(event) == 0) {
+      mark_fallback(Brr_source_fallback_reason::COMMIT_SEND_FAILED);
+      return;
+    }
+
+    m_state = Brr_source_ddl_state::COMMIT_SENT;
+    release_in_flight_slot();
+  }
+
+  void send_rollback_if_prepared(uint32_t error_code,
+                                 const char *error_message) {
+    if (!m_prepare_sent || m_state == Brr_source_ddl_state::COMMIT_SENT ||
+        m_state == Brr_source_ddl_state::ROLLBACK_SENT)
+      return;
+
+    Brr_event event;
+    event.type = mysql::binlog::event::BRR_DDL_ROLLBACK_EVENT;
+    event.rollback.common = m_common;
+    event.rollback.source_error_code = error_code;
+    if (error_message != nullptr)
+      event.rollback.source_error_message.assign(error_message);
+    event.rollback.allow_fallback = 1;
+
+    if (brr_source_enqueue_event(event) == 0) {
+      mark_fallback(Brr_source_fallback_reason::ROLLBACK_SEND_FAILED);
+      return;
+    }
+
+    m_state = Brr_source_ddl_state::ROLLBACK_SENT;
+    release_in_flight_slot();
+  }
+
+  void mark_done() {
+    if (!is_fallback()) m_state = Brr_source_ddl_state::DONE;
+    release_in_flight_slot();
+  }
+
+  bool is_prepare_ready() const {
+    return m_state == Brr_source_ddl_state::GTID_RESERVED && !m_prepare_sent;
+  }
+
+  bool is_prepared() const { return m_prepare_sent; }
+
+  Brr_source_ddl_state state() const { return m_state; }
+
+  Brr_source_fallback_reason fallback_reason() const {
+    return m_fallback_reason;
+  }
+
+ private:
+  bool is_system_schema(const char *db) {
+    if (db == nullptr) return true;
+    return is_infoschema_db(db) || is_perfschema_db(db) ||
+           !my_strcasecmp(system_charset_info, MYSQL_SCHEMA_NAME.str, db) ||
+           !my_strcasecmp(system_charset_info, "sys", db);
+  }
+
+  bool is_supported_inplace_result(
+      enum_alter_inplace_result inplace_supported) {
+    return inplace_supported == HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE;
+  }
+
+  bool is_supported_add_index_flags(
+      Alter_inplace_info::HA_ALTER_FLAGS flags) {
+    if (flags & Alter_inplace_info::ADD_UNIQUE_INDEX) {
+      mark_fallback(Brr_source_fallback_reason::UNIQUE_INDEX);
+      return false;
+    }
+    if (flags & Alter_inplace_info::ADD_PK_INDEX) {
+      mark_fallback(Brr_source_fallback_reason::PRIMARY_KEY_CHANGE);
+      return false;
+    }
+    if (flags & Alter_inplace_info::ADD_SPATIAL_INDEX) {
+      mark_fallback(Brr_source_fallback_reason::SPATIAL_INDEX);
+      return false;
+    }
+    if (flags & (Alter_inplace_info::ADD_FOREIGN_KEY |
+                 Alter_inplace_info::DROP_FOREIGN_KEY)) {
+      mark_fallback(Brr_source_fallback_reason::FOREIGN_KEY_RELATED);
+      return false;
+    }
+    if (flags & (Alter_inplace_info::ALTER_RENAME |
+                 Alter_inplace_info::RENAME_INDEX)) {
+      mark_fallback(Brr_source_fallback_reason::RENAME_RELATED);
+      return false;
+    }
+    if (!(flags & Alter_inplace_info::ADD_INDEX) ||
+        flags != Alter_inplace_info::ADD_INDEX) {
+      mark_fallback(Brr_source_fallback_reason::UNSUPPORTED_ALTER_FLAGS);
+      return false;
+    }
+    return true;
+  }
+
+  bool reserve_gtid_for_brr(THD *thd) {
+    if (m_state != Brr_source_ddl_state::ELIGIBLE) return false;
+
+    if (thd == nullptr || gtid_state == nullptr || global_tsid_lock == nullptr) {
+      mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+      return false;
+    }
+
+    if (!thd->variables.gtid_next.is_automatic() ||
+        !thd->owned_gtid_is_empty()) {
+      mark_fallback(Brr_source_fallback_reason::GTID_NEXT_NOT_AUTOMATIC);
+      return false;
+    }
+    if (thd->variables.gtid_next.is_automatic_tagged()) {
+      mark_fallback(Brr_source_fallback_reason::GTID_TAGGED_NOT_SUPPORTED);
+      return false;
+    }
+
+    Gtid_specification spec;
+    spec.set_automatic();
+    spec.gtid.clear();
+    spec.type = PRE_GENERATE_GTID;
+    spec.gtid.sidno = gtid_state->get_server_sidno();
+    spec.gtid.gno = 0;
+
+    if (spec.gtid.sidno <= 0) {
+      mark_fallback(Brr_source_fallback_reason::GTID_PRE_GENERATE_FAILED);
+      return false;
+    }
+
+    /*
+      PRE_GENERATE_GTID acquires ownership and turns @@session.gtid_next into
+      ASSIGNED_GTID. The later normal binlog commit path writes the GTID event
+      from this same THD ownership.
+    */
+    global_tsid_lock->rdlock();
+    if (set_gtid_next(thd, spec)) {
+      mark_fallback(Brr_source_fallback_reason::GTID_PRE_GENERATE_FAILED);
+      return false;
+    }
+
+    m_reserved_sidno = thd->owned_gtid.sidno;
+    mark_gtid_reserved(thd->owned_gtid.gno);
+    if (!matches_reserved_gtid(thd)) {
+      mark_fallback(Brr_source_fallback_reason::GTID_MISMATCH);
+      return false;
+    }
+
+    return true;
+  }
+
+  bool acquire_in_flight_slot() {
+    bool expected = false;
+    if (!brr_source_ddl_in_flight.compare_exchange_strong(expected, true)) {
+      mark_fallback(Brr_source_fallback_reason::ANOTHER_DDL_IN_FLIGHT);
+      return false;
+    }
+    m_in_flight_slot_acquired = true;
+    return true;
+  }
+
+  void release_in_flight_slot() {
+    if (!m_in_flight_slot_acquired) return;
+    brr_source_ddl_in_flight.store(false);
+    m_in_flight_slot_acquired = false;
+  }
+
+  bool matches_reserved_gtid(THD *thd) const {
+    if (thd == nullptr || !has_reserved_gtid()) return false;
+
+    return thd->owned_gtid.sidno == m_reserved_sidno &&
+           thd->owned_gtid.gno == m_common.gtid_gno &&
+           thd->variables.gtid_next.is_assigned() &&
+           thd->variables.gtid_next.gtid.sidno == m_reserved_sidno &&
+           thd->variables.gtid_next.gtid.gno == m_common.gtid_gno;
+  }
+
+  bool has_reserved_gtid() const {
+    return m_reserved_sidno > 0 && m_common.gtid_gno > 0;
+  }
+
+  bool are_supported_added_indexes(Alter_inplace_info *ha_alter_info) {
+    if (ha_alter_info->index_add_count == 0 ||
+        ha_alter_info->index_add_buffer == nullptr ||
+        ha_alter_info->key_info_buffer == nullptr) {
+      mark_fallback(Brr_source_fallback_reason::UNSUPPORTED_ALTER_FLAGS);
+      return false;
+    }
+
+    for (uint add_key_idx = 0; add_key_idx < ha_alter_info->index_add_count;
+         ++add_key_idx) {
+      const uint key_idx = ha_alter_info->index_add_buffer[add_key_idx];
+      if (key_idx >= ha_alter_info->key_count) {
+        mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+        return false;
+      }
+
+      const KEY *key = ha_alter_info->key_info_buffer + key_idx;
+      if (key->flags & HA_NOSAME) {
+        mark_fallback(Brr_source_fallback_reason::UNIQUE_INDEX);
+        return false;
+      }
+      if ((key->flags & HA_FULLTEXT) || key->algorithm == HA_KEY_ALG_FULLTEXT) {
+        mark_fallback(Brr_source_fallback_reason::FULLTEXT_INDEX);
+        return false;
+      }
+      if ((key->flags & HA_SPATIAL) || key->algorithm == HA_KEY_ALG_RTREE) {
+        mark_fallback(Brr_source_fallback_reason::SPATIAL_INDEX);
+        return false;
+      }
+      if ((key->flags & HA_GENERATED_KEY) || key->is_functional_index()) {
+        mark_fallback(Brr_source_fallback_reason::FUNCTIONAL_INDEX);
+        return false;
+      }
+      if (key->key_part == nullptr) {
+        mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+        return false;
+      }
+
+      for (uint part_idx = 0; part_idx < key->user_defined_key_parts;
+           ++part_idx) {
+        const Field *field = key->key_part[part_idx].field;
+        if (field == nullptr) {
+          mark_fallback(Brr_source_fallback_reason::UNSAFE_DDL_PHASE);
+          return false;
+        }
+        if (field->is_field_for_functional_index()) {
+          mark_fallback(Brr_source_fallback_reason::FUNCTIONAL_INDEX);
+          return false;
+        }
+        if (field->is_gcol()) {
+          mark_fallback(Brr_source_fallback_reason::GENERATED_COLUMN);
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool is_fallback() const {
+    return m_state == Brr_source_ddl_state::FALLBACK;
+  }
+
+  void mark_fallback(Brr_source_fallback_reason reason) {
+    m_fallback_reason = reason;
+    m_state = Brr_source_ddl_state::FALLBACK;
+    if (!m_prepare_sent) release_in_flight_slot();
+  }
+
+  Brr_source_ddl_state m_state{Brr_source_ddl_state::INIT};
+  Brr_source_fallback_reason m_fallback_reason{
+      Brr_source_fallback_reason::NONE};
+  Brr_event_common m_common;
+  bool m_prepare_sent{false};
+  bool m_in_flight_slot_acquired{false};
+  std::string m_schema_name;
+  std::string m_table_name;
+  std::string m_query;
+  uint32_t m_ddl_type{0};
+  uint32_t m_ddl_algorithm{0};
+  uint32_t m_ddl_lock_type{0};
+  rpl_sidno m_reserved_sidno{0};
+  std::string m_prepare_dependency_gtid_set;
+  std::string m_commit_dependency_gtid_set;
+  std::string m_session_variables;
+};
 
 struct Handlerton_pair {
   handlerton *requested;
@@ -13576,6 +14108,7 @@ static bool remove_secondary_engine(THD *thd, const Table_ref &table,
   @param[out] fk_invalidator  Set of parent tables which participate in FKs
                               together with table being altered and which
                               entries in DD cache need to be invalidated.
+  @param brr_ddl_ctx        Source-side BRR context for this DDL.
 
   @retval   true              Error
   @retval   false             Success
@@ -13600,7 +14133,8 @@ static bool mysql_inplace_alter_table(
     Alter_inplace_info *ha_alter_info,
     enum_alter_inplace_result inplace_supported, Alter_table_ctx *alter_ctx,
     histograms::columns_set &columns, FOREIGN_KEY *fk_key_info,
-    uint fk_key_count, Foreign_key_parents_invalidator *fk_invalidator) {
+    uint fk_key_count, Foreign_key_parents_invalidator *fk_invalidator,
+    Brr_source_ddl_context *brr_ddl_ctx) {
   handlerton *db_type = table->s->db_type();
   MDL_ticket *mdl_ticket = table->mdl_ticket;
   Alter_info *alter_info = ha_alter_info->alter_info;
@@ -13769,6 +14303,8 @@ static bool mysql_inplace_alter_table(
 
   DEBUG_SYNC(thd, "alter_table_inplace_after_lock_upgrade");
   THD_STAGE_INFO(thd, stage_alter_inplace_prepare);
+  if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepare_ready())
+    brr_ddl_ctx->send_prepare_if_ready();
 
   switch (inplace_supported) {
     case HA_ALTER_ERROR:
@@ -13830,6 +14366,8 @@ static bool mysql_inplace_alter_table(
 
     DEBUG_SYNC(thd, "alter_table_inplace_after_lock_downgrade");
     THD_STAGE_INFO(thd, stage_alter_inplace);
+    if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared())
+      brr_ddl_ctx->mark_executing();
 
     if (table->file->ha_inplace_alter_table(altered_table, ha_alter_info,
                                             table_def, altered_table_def)) {
@@ -14029,9 +14567,17 @@ static bool mysql_inplace_alter_table(
            thd->is_current_stmt_binlog_format_row() &&
            (ha_alter_info->create_info->options & HA_LEX_CREATE_TMP_TABLE)));
 
+  bool brr_original_gtid_verified = false;
   if (write_bin_log(thd, true, thd->query().str, thd->query().length,
-                    (db_type->flags & HTON_SUPPORTS_ATOMIC_DDL)))
+                    (db_type->flags & HTON_SUPPORTS_ATOMIC_DDL))) {
+    if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared())
+      brr_ddl_ctx->send_rollback_if_prepared(0, "source binlog write failed");
     goto cleanup2;
+  }
+  if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared() &&
+      !(brr_original_gtid_verified =
+            brr_ddl_ctx->verify_original_binlog_gtid(thd)))
+    brr_ddl_ctx->send_rollback_if_prepared(0, "BRR GTID mismatch");
 
   {
     Uncommitted_tables_guard uncommitted_tables(thd);
@@ -14087,6 +14633,12 @@ static bool mysql_inplace_alter_table(
     /* Call SE DDL post-commit hook. */
     if (db_type->post_ddl) db_type->post_ddl(thd);
 
+    if (brr_original_gtid_verified && brr_ddl_ctx != nullptr &&
+        brr_ddl_ctx->is_prepared())
+      brr_ddl_ctx->send_commit_if_prepared();
+    if (brr_ddl_ctx != nullptr)
+      brr_ddl_ctx->restore_gtid_next_after_brr(thd);
+
     /*
       Finally we can tell SE supporting atomic DDL that the changed table
       in the data-dictionary.
@@ -14114,6 +14666,8 @@ static bool mysql_inplace_alter_table(
   return false;
 
 rollback:
+  if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared())
+    brr_ddl_ctx->send_rollback_if_prepared(0, "source inplace DDL rollback");
   table->file->ha_commit_inplace_alter_table(
       altered_table, ha_alter_info, false, table_def, altered_table_def);
   thd->check_for_truncated_fields = CHECK_FIELD_IGNORE;
@@ -14122,6 +14676,8 @@ cleanup:
   close_temporary_table(thd, altered_table, true, false);
 
 cleanup2:
+  if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared())
+    brr_ddl_ctx->send_rollback_if_prepared(0, "source inplace DDL rollback");
 
   (void)trans_rollback_stmt(thd);
   /*
@@ -14130,6 +14686,7 @@ cleanup2:
     rollback doesn't clear DD cache of modified uncommitted objects).
   */
   (void)trans_rollback(thd);
+  if (brr_ddl_ctx != nullptr) brr_ddl_ctx->restore_gtid_next_after_brr(thd);
 
   if ((db_type->flags & HTON_SUPPORTS_ATOMIC_DDL) && db_type->post_ddl)
     db_type->post_ddl(thd);
@@ -16461,6 +17018,9 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
                        Alter_info *alter_info) {
   DBUG_TRACE;
 
+  Brr_source_ddl_context brr_ddl_ctx;
+  brr_ddl_ctx.begin_eligibility(thd, table_list);
+
   /*
     Check if we attempt to alter mysql.slow_log or
     mysql.general_log table and return an error if
@@ -17707,16 +18267,21 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
     }
 
     if (use_inplace) {
+      brr_ddl_ctx.evaluate_inplace_add_index_candidate(
+          thd, table_list, table, &ha_alter_info, inplace_supported);
       if (mysql_inplace_alter_table(thd, *schema, *new_schema, old_table_def,
                                     table_def, table_list, table, altered_table,
                                     &ha_alter_info, inplace_supported,
                                     &alter_ctx, columns, fk_key_info,
-                                    fk_key_count, &fk_invalidator)) {
+                                    fk_key_count, &fk_invalidator,
+                                    &brr_ddl_ctx)) {
         return true;
       }
 
+      brr_ddl_ctx.mark_done();
       goto end_inplace;
     } else {
+      brr_ddl_ctx.mark_copy_fallback();
       close_temporary_table(thd, altered_table, true, false);
     }
   }
