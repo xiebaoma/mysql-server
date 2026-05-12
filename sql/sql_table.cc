@@ -646,6 +646,7 @@ class Brr_source_ddl_context {
     */
     global_tsid_lock->rdlock();
     if (set_gtid_next(thd, spec)) {
+      global_tsid_lock->unlock();
       mark_fallback(Brr_source_fallback_reason::GTID_PRE_GENERATE_FAILED);
       return false;
     }
@@ -653,10 +654,12 @@ class Brr_source_ddl_context {
     m_reserved_sidno = thd->owned_gtid.sidno;
     mark_gtid_reserved(thd->owned_gtid.gno);
     if (!matches_reserved_gtid(thd)) {
+      global_tsid_lock->unlock();
       mark_fallback(Brr_source_fallback_reason::GTID_MISMATCH);
       return false;
     }
 
+    global_tsid_lock->unlock();
     return true;
   }
 
