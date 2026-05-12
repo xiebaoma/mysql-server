@@ -1075,6 +1075,7 @@ SET (RPL_REPLICA_SRCS
   rpl_rli_pdb.cc
   rpl_relay_log_sanitizer.cc
   rpl_replica.cc
+  rpl_brr_worker.cc
   rpl_replica_commit_order_manager.cc
   rpl_replica_until_options.cc
   rpl_sys_key_access.cc

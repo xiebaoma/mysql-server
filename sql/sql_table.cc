@@ -14143,6 +14143,10 @@ static bool mysql_inplace_alter_table(
   Alter_info *alter_info = ha_alter_info->alter_info;
   bool reopen_tables = false;
   bool rollback_needs_dict_cache_reset = false;
+  // Declared up here (not at the BRR write-binlog block below) so that the
+  // earlier `goto cleanup` / `goto cleanup2` / `goto rollback` statements
+  // do not cross its initialization.
+  bool brr_original_gtid_verified = false;
   MDL_request_list mdl_requests;
 
   DBUG_TRACE;
@@ -14570,7 +14574,6 @@ static bool mysql_inplace_alter_table(
            thd->is_current_stmt_binlog_format_row() &&
            (ha_alter_info->create_info->options & HA_LEX_CREATE_TMP_TABLE)));
 
-  bool brr_original_gtid_verified = false;
   if (write_bin_log(thd, true, thd->query().str, thd->query().length,
                     (db_type->flags & HTON_SUPPORTS_ATOMIC_DDL))) {
     if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepared())

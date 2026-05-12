@@ -30,7 +30,8 @@
 #include "mysql/binlog/event/binlog_event.h"  // checksum_crc32, BINLOG_CHECKSUM_LEN
 #include "sql/log_event.h"                     // server_id, LOG_EVENT_HEADER_LEN
 
-using mysql::binlog::event::BINLOG_CHECKSUM_LEN;
+// BINLOG_CHECKSUM_LEN is a #define macro (global, not namespaced) — do not
+// `using`-import it.
 using mysql::binlog::event::checksum_crc32;
 
 using mysql::binlog::event::BRR_DDL_COMMIT_EVENT;
