@@ -94,6 +94,9 @@ class Binlog_sender {
   /** Send all queued BRR events to the replica.  Called by the dump thread. */
   int flush_brr_queue();
 
+  /** True when this sender has BRR events pending in its local queue. */
+  bool has_pending_brr_events();
+
   /** Encode and send a single BRR event over the network. */
   int send_brr_event_packet(const Brr_event &ev);
   /**
@@ -205,6 +208,8 @@ class Binlog_sender {
   uint32 m_flag;
   /// True if both source and replica have BRR enabled.
   bool m_brr_capability_negotiated{false};
+  /// True after this sender has been added to the source BRR registry.
+  bool m_brr_registered{false};
 
   /// Queue of pre-encoded BRR events waiting to be sent.
   /// Populated by the session thread (via enqueue_brr_event) and

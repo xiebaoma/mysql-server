@@ -58,6 +58,7 @@
 #include "sql/mysqld.h"  // global_system_variables ...
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
+#include "sql/rpl_brr_source.h"
 #include "sql/rpl_constants.h"  // BINLOG_DUMP_NON_BLOCK
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_handler.h"    // RUN_HOOK
@@ -213,6 +214,63 @@ class Sender_context_guard {
 static std::chrono::nanoseconds now_in_nanosecs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::high_resolution_clock::now().time_since_epoch());
+}
+
+namespace {
+
+std::mutex brr_source_sender_registry_mutex;
+std::vector<Binlog_sender *> brr_source_sender_registry;
+
+void brr_source_wake_dump_threads() {
+  mysql_bin_log.lock_binlog_end_pos();
+  mysql_cond_broadcast(mysql_bin_log.get_log_cond());
+  mysql_bin_log.unlock_binlog_end_pos();
+}
+
+void brr_source_register_sender(Binlog_sender *sender) {
+  if (sender == nullptr || !sender->is_brr_capability_negotiated()) return;
+
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  if (std::find(brr_source_sender_registry.begin(),
+                brr_source_sender_registry.end(),
+                sender) == brr_source_sender_registry.end()) {
+    brr_source_sender_registry.push_back(sender);
+  }
+}
+
+void brr_source_unregister_sender(Binlog_sender *sender) {
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  brr_source_sender_registry.erase(
+      std::remove(brr_source_sender_registry.begin(),
+                  brr_source_sender_registry.end(), sender),
+      brr_source_sender_registry.end());
+}
+
+}  // namespace
+
+size_t brr_source_enqueue_event(const Brr_event &event) {
+  size_t accepted_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+    for (Binlog_sender *sender : brr_source_sender_registry) {
+      if (sender->is_brr_capability_negotiated() &&
+          sender->enqueue_brr_event(event)) {
+        ++accepted_count;
+      }
+    }
+  }
+
+  if (accepted_count > 0) brr_source_wake_dump_threads();
+  return accepted_count;
+}
+
+bool brr_source_has_registered_sender() {
+  return brr_source_registered_sender_count() > 0;
+}
+
+size_t brr_source_registered_sender_count() {
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  return brr_source_sender_registry.size();
 }
 
 /**
@@ -371,12 +429,22 @@ void Binlog_sender::init() {
         "--sporadic-binlog-dump-fail");
   m_event_count = 0;
 #endif
+
+  if (!has_error() && m_brr_capability_negotiated) {
+    brr_source_register_sender(this);
+    m_brr_registered = true;
+  }
 }
 
 void Binlog_sender::cleanup() {
   DBUG_TRACE;
 
   THD *thd = m_thd;
+
+  if (m_brr_registered) {
+    brr_source_unregister_sender(this);
+    m_brr_registered = false;
+  }
 
   if (m_transmit_started)
     (void)RUN_HOOK(binlog_transmit, transmit_stop, (thd, m_flag));
@@ -836,6 +904,12 @@ inline int Binlog_sender::wait_with_heartbeat(my_off_t log_pos) {
     }
     mysql_bin_log.unlock_binlog_end_pos();
     Scope_guard lock([]() { mysql_bin_log.lock_binlog_end_pos(); });
+
+    if (m_brr_capability_negotiated && has_pending_brr_events()) {
+      if (flush_brr_queue()) return 1;
+      continue;
+    }
+
 #ifndef NDEBUG
     if (hb_info_counter < 3) {
       LogErr(INFORMATION_LEVEL, ER_RPL_BINLOG_SOURCE_SENDS_HEARTBEAT);
@@ -855,6 +929,11 @@ inline int Binlog_sender::wait_without_heartbeat(my_off_t log_pos) {
   int res = 0;
   while (!stop_waiting_for_update(log_pos)) {
     res = mysql_bin_log.wait_for_update();
+    if (m_brr_capability_negotiated && has_pending_brr_events()) {
+      mysql_bin_log.unlock_binlog_end_pos();
+      Scope_guard lock([]() { mysql_bin_log.lock_binlog_end_pos(); });
+      if (flush_brr_queue()) return 1;
+    }
   }
   return res;
 }
@@ -1579,6 +1658,11 @@ bool Binlog_sender::enqueue_brr_event(const Brr_event &ev) {
     m_brr_event_queue.push(std::move(buffer));
   }
   return true;
+}
+
+bool Binlog_sender::has_pending_brr_events() {
+  std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+  return !m_brr_event_queue.empty();
 }
 
 int Binlog_sender::flush_brr_queue() {
