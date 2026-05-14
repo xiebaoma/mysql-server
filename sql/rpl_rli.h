@@ -1825,6 +1825,25 @@ class Relay_log_info : public Rpl_info {
  protected:
   Format_description_log_event *rli_description_event;
 
+ public:
+  /// In-memory queue for BRR events.  Populated by the IO thread,
+  /// consumed by the BRR worker.  Not crash-safe — cleared on restart.
+  Brr_queue m_brr_queue;
+
+  /// BRR worker thread control.  Public to match the visibility of
+  /// the SQL thread's `slave_running` / `abort_slave` (declared on
+  /// Rpl_info), since these are read from rpl_replica.cc and
+  /// changestreams/apply/replication_thread_status.cc.
+  std::atomic<uint> m_brr_worker_running{0};
+  std::atomic<ulong> m_brr_worker_run_id{0};
+  std::atomic<bool> m_brr_worker_abort{false};
+  mysql_cond_t m_brr_start_cond;
+  mysql_cond_t m_brr_stop_cond;
+
+  /// BRR worker THD.  Protected by run_lock + info_thd_lock, matching
+  /// the Rpl_info contract for `*_info_thd` (see sql/rpl_info.h).
+  THD *m_brr_info_thd{nullptr};
+
  private:
   /*
     Commit order manager to order commits made by its workers. In context of
@@ -1832,10 +1851,6 @@ class Relay_log_info : public Rpl_info {
     corrdinator's order manager.
    */
   Commit_order_manager *commit_order_mngr;
-
-  /// In-memory queue for BRR events.  Populated by the IO thread,
-  /// consumed by the BRR worker.  Not crash-safe — cleared on restart.
-  Brr_queue m_brr_queue;
 
   /**
     Delay slave SQL thread by this amount of seconds.

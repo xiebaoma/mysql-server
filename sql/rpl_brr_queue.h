@@ -16,6 +16,7 @@
 #ifndef RPL_BRR_QUEUE_H
 #define RPL_BRR_QUEUE_H
 
+#include <condition_variable>
 #include <mutex>
 #include <queue>
 
@@ -36,14 +37,18 @@ class Brr_queue {
 
   Brr_queue() = default;
 
-  /** Append a decoded BRR event.  Returns false if the queue is full. */
+  /**
+   * Append a decoded BRR event.
+   * Returns false when the queue is full or has been aborted.
+   */
   bool enqueue(Brr_event &&ev) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_queue.size() >= MAX_QUEUE_SIZE) {
+    if (m_aborted || m_queue.size() >= MAX_QUEUE_SIZE) {
       ++m_rejected_count;
       return false;
     }
     m_queue.push(std::move(ev));
+    m_cond.notify_one();
     return true;
   }
 
@@ -56,10 +61,47 @@ class Brr_queue {
     return true;
   }
 
-  /** Discard all pending events. */
+  /**
+   * Blocking dequeue.  Waits until an event is available or the queue is
+   * aborted (e.g. IO thread disconnected).
+   *
+   * @param out  Receives the dequeued event.
+   * @return true on success, false if waiting was interrupted (abort).
+   */
+  bool dequeue_blocking(Brr_event *out) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    while (m_queue.empty() && !m_aborted) m_cond.wait(lock);
+    if (m_queue.empty()) return false;  // aborted
+    *out = std::move(m_queue.front());
+    m_queue.pop();
+    return true;
+  }
+
+  /** Discard all pending events and wake any blocked dequeue. */
   void clear() {
     std::lock_guard<std::mutex> lock(m_mutex);
     while (!m_queue.empty()) m_queue.pop();
+    m_aborted = true;
+    m_cond.notify_all();
+  }
+
+  /** Wake up any thread blocked on dequeue_blocking(). */
+  void wakeup() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_cond.notify_all();
+  }
+
+  /** Signal shutdown — dequeue_blocking() will return false. */
+  void abort() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_aborted = true;
+    m_cond.notify_all();
+  }
+
+  /** Reset aborted flag (for restart). */
+  void reset_aborted() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_aborted = false;
   }
 
   bool is_empty() const {
@@ -80,8 +122,10 @@ class Brr_queue {
 
  private:
   mutable std::mutex m_mutex;
+  std::condition_variable m_cond;
   std::queue<Brr_event> m_queue;
   uint64_t m_rejected_count{0};
+  bool m_aborted{false};
 };
 
 #endif  // RPL_BRR_QUEUE_H

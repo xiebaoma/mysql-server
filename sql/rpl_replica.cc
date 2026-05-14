@@ -129,6 +129,7 @@
 #include "sql/rpl_async_conn_failover.h"
 #include "sql/rpl_async_conn_failover_configuration_propagation.h"
 #include "sql/rpl_brr_event.h"
+#include "sql/rpl_brr_worker.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_group_replication.h"
 #include "sql/rpl_gtid.h"
@@ -413,7 +414,8 @@ static void set_replica_max_allowed_packet(THD *thd, MYSQL *mysql) {
 static PSI_memory_key key_memory_rli_mta_coor;
 
 static PSI_thread_key key_thread_replica_io, key_thread_replica_sql,
-    key_thread_replica_worker, key_thread_replica_monitor_io;
+    key_thread_replica_worker, key_thread_replica_monitor_io,
+    key_thread_replica_brr;
 
 static PSI_thread_info all_slave_threads[] = {
     {&key_thread_replica_io, "replica_io", "rpl_rca_io", PSI_FLAG_THREAD_SYSTEM,
@@ -423,7 +425,9 @@ static PSI_thread_info all_slave_threads[] = {
     {&key_thread_replica_worker, "replica_worker", "rpl_rca_wkr",
      PSI_FLAG_THREAD_SYSTEM, 0, PSI_DOCUMENT_ME},
     {&key_thread_replica_monitor_io, "replica_monitor", "rpl_rca_mon",
-     PSI_FLAG_SINGLETON | PSI_FLAG_THREAD_SYSTEM, 0, PSI_DOCUMENT_ME}};
+     PSI_FLAG_SINGLETON | PSI_FLAG_THREAD_SYSTEM, 0, PSI_DOCUMENT_ME},
+    {&key_thread_replica_brr, "replica_brr", "rpl_rca_brr",
+     PSI_FLAG_THREAD_SYSTEM, 0, PSI_DOCUMENT_ME}};
 
 static PSI_memory_info all_slave_memory[] = {{&key_memory_rli_mta_coor,
                                               "Relay_log_info::mta_coor", 0, 0,
@@ -1726,6 +1730,35 @@ int terminate_slave_threads(Master_info *mi, int thread_mask,
   */
   ulong total_stop_wait_timeout = stop_wait_timeout;
 
+  if (thread_mask & (REPLICA_BRR | REPLICA_SQL | SLAVE_FORCE_ALL)) {
+    DBUG_PRINT("info", ("Terminating BRR worker"));
+
+    /*
+      Terminate the BRR worker before the SQL thread.
+      The BRR worker may hold GTID ownership; it must release it
+      before the SQL thread attempts to proceed on the same GTID.
+    */
+    if (mi->rli->m_brr_worker_running) {
+      mi->rli->m_brr_worker_abort.store(true);
+      /*
+        abort() (not wakeup()) is required: wakeup() only notifies the
+        condition variable but leaves the dequeue predicate
+        (queue.empty() && !aborted) true, so the worker would wake up
+        and immediately re-wait.  abort() sets m_aborted=true so
+        dequeue_blocking() returns false and the worker exits its main
+        loop.  reset_aborted() is called on the next START REPLICA.
+      */
+      mi->rli->m_brr_queue.abort();
+      if ((error = terminate_slave_thread(
+               mi->rli->m_brr_info_thd, sql_lock, &mi->rli->m_brr_stop_cond,
+               &mi->rli->m_brr_worker_running, &total_stop_wait_timeout,
+               need_lock_term)) &&
+          !force_all) {
+        return error;
+      }
+    }
+  }
+
   if (thread_mask & (REPLICA_SQL | SLAVE_FORCE_ALL)) {
     DBUG_PRINT("info", ("Terminating SQL thread"));
     mi->rli->abort_slave = true;
@@ -2141,9 +2174,24 @@ bool start_slave_threads(bool need_lock_slave, bool wait_for_start,
       is_error = start_slave_thread(
           key_thread_replica_sql, handle_slave_sql, lock_sql, lock_cond_sql,
           cond_sql, &mi->rli->slave_running, &mi->rli->slave_run_id, mi);
+
+    /*
+      Start the BRR worker alongside the SQL thread when BRR is enabled.
+      The BRR worker depends on the SQL thread being alive and is
+      terminated before the SQL thread on stop.
+    */
+    if (!is_error && opt_binlog_realtime_replication) {
+      is_error = start_slave_thread(
+          key_thread_replica_brr, handle_slave_brr, lock_sql, lock_cond_sql,
+          &mi->rli->m_brr_start_cond, &mi->rli->m_brr_worker_running,
+          &mi->rli->m_brr_worker_run_id, mi);
+    }
+
     if (is_error)
-      terminate_slave_threads(mi, thread_mask & (REPLICA_IO | SLAVE_MONITOR),
-                              rpl_stop_replica_timeout, need_lock_slave);
+      terminate_slave_threads(
+          mi,
+          thread_mask & (REPLICA_IO | REPLICA_SQL | REPLICA_BRR | SLAVE_MONITOR),
+          rpl_stop_replica_timeout, need_lock_slave);
   }
   return is_error;
 }
@@ -4038,8 +4086,9 @@ int init_replica_thread(THD *thd, SLAVE_THD_TYPE thd_type) {
 #endif
   thd->system_thread = (thd_type == SLAVE_THD_WORKER)
                            ? SYSTEM_THREAD_SLAVE_WORKER
-                       : (thd_type == SLAVE_THD_SQL) ? SYSTEM_THREAD_SLAVE_SQL
-                                                     : SYSTEM_THREAD_SLAVE_IO;
+                       : (thd_type == SLAVE_THD_SQL)    ? SYSTEM_THREAD_SLAVE_SQL
+                       : (thd_type == SLAVE_THD_BRR)     ? SYSTEM_THREAD_SLAVE_BRR
+                                                        : SYSTEM_THREAD_SLAVE_IO;
   thd->get_protocol_classic()->init_net(nullptr);
   thd->slave_thread = true;
   thd->enable_slow_log = opt_log_slow_replica_statements;
@@ -5617,12 +5666,14 @@ extern "C" void *handle_slave_io(void *arg) {
 
           /* Determine the agreed checksum algorithm. */
           enum_binlog_checksum_alg checksum_alg =
-              mi->checksum_alg_before_fd != BINLOG_CHECKSUM_ALG_UNDEF
+              mi->checksum_alg_before_fd !=
+                      mysql::binlog::event::BINLOG_CHECKSUM_ALG_UNDEF
                   ? mi->checksum_alg_before_fd
                   : mi->rli->relay_log.relay_log_checksum_alg;
           bool checksum_enabled =
-              (checksum_alg > BINLOG_CHECKSUM_ALG_OFF &&
-               checksum_alg < BINLOG_CHECKSUM_ALG_ENUM_END);
+              (checksum_alg > mysql::binlog::event::BINLOG_CHECKSUM_ALG_OFF &&
+               checksum_alg <
+                   mysql::binlog::event::BINLOG_CHECKSUM_ALG_ENUM_END);
 
           /* Verify CRC32 when checksums are enabled. */
           if (checksum_enabled &&

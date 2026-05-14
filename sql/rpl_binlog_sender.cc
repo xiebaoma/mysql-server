@@ -1629,13 +1629,13 @@ bool Binlog_sender::enqueue_brr_event(const Brr_event &ev) {
 
   size_t max_size = 0;
   switch (ev.type) {
-    case BRR_DDL_PREPARE_EVENT:
+    case mysql::binlog::event::BRR_DDL_PREPARE_EVENT:
       max_size = max_encode_size_prepare(ev.prepare);
       break;
-    case BRR_DDL_COMMIT_EVENT:
+    case mysql::binlog::event::BRR_DDL_COMMIT_EVENT:
       max_size = max_encode_size_commit(ev.commit);
       break;
-    case BRR_DDL_ROLLBACK_EVENT:
+    case mysql::binlog::event::BRR_DDL_ROLLBACK_EVENT:
       max_size = max_encode_size_rollback(ev.rollback);
       break;
     default:
@@ -1687,13 +1687,13 @@ int Binlog_sender::flush_brr_queue() {
 int Binlog_sender::send_brr_event_packet(const Brr_event &ev) {
   size_t max_size = 0;
   switch (ev.type) {
-    case BRR_DDL_PREPARE_EVENT:
+    case mysql::binlog::event::BRR_DDL_PREPARE_EVENT:
       max_size = max_encode_size_prepare(ev.prepare);
       break;
-    case BRR_DDL_COMMIT_EVENT:
+    case mysql::binlog::event::BRR_DDL_COMMIT_EVENT:
       max_size = max_encode_size_commit(ev.commit);
       break;
-    case BRR_DDL_ROLLBACK_EVENT:
+    case mysql::binlog::event::BRR_DDL_ROLLBACK_EVENT:
       max_size = max_encode_size_rollback(ev.rollback);
       break;
     default:

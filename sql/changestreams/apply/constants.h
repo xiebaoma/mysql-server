@@ -30,5 +30,6 @@ static constexpr unsigned long REPLICA_IO = 1;
 static constexpr unsigned long REPLICA_SQL = 2;
 // We also have SLAVE_FORCE_ALL 4
 static constexpr unsigned long SLAVE_MONITOR = 8;
+static constexpr unsigned long REPLICA_BRR = 16;
 
 #endif /* CHANGE_STREAM_APPLY_CONSTANTS_H_ */
