@@ -153,6 +153,8 @@
 #include "sql/query_options.h"
 #include "sql/rpl_brr_event.h"
 #include "sql/rpl_brr_source.h"
+#include "sql/rpl_brr_worker.h"
+#include "sql/tztime.h"       // Time_zone
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_rli.h"  // rli_slave etc
 #include "sql/session_tracker.h"
@@ -473,12 +475,15 @@ class Brr_source_ddl_context {
     m_commit_dependency_gtid_set = gtid_set;
   }
 
-  void send_prepare_if_ready() {
+  void send_prepare_if_ready(THD *thd) {
     if (!is_prepare_ready()) {
       if (!is_fallback() && !m_prepare_sent)
         mark_fallback(Brr_source_fallback_reason::GTID_NOT_RESERVED);
       return;
     }
+
+    // Capture session variables that affect DDL behaviour
+    capture_session_variables(thd);
 
     Brr_event event;
     event.type = mysql::binlog::event::BRR_DDL_PREPARE_EVENT;
@@ -749,6 +754,59 @@ class Brr_source_ddl_context {
       }
     }
     return true;
+  }
+
+  /**
+     Capture the current session variables from THD into the wire-format
+     m_session_variables string.
+
+     Format: null-separated key=value pairs, e.g.:
+     "sql_mode=123\0character_set_client=utf8mb4\0..."
+   */
+  void capture_session_variables(THD *thd) {
+    if (thd == nullptr) return;
+
+    auto append_kv = [this](const char *key, const std::string &value) {
+      m_session_variables.append(key);
+      m_session_variables.push_back('=');
+      m_session_variables.append(value);
+      m_session_variables.push_back('\0');
+    };
+
+    m_session_variables.clear();
+
+    // sql_mode
+    append_kv("sql_mode", std::to_string(thd->variables.sql_mode));
+
+    // character set / collation
+    if (thd->variables.character_set_client != nullptr) {
+      append_kv("character_set_client",
+                thd->variables.character_set_client->csname);
+      if (thd->variables.collation_connection != nullptr)
+        append_kv("collation_connection",
+                  thd->variables.collation_connection->m_coll_name);
+      if (thd->variables.collation_server != nullptr)
+        append_kv("collation_server",
+                  thd->variables.collation_server->m_coll_name);
+    }
+
+    // time_zone
+    if (thd->variables.time_zone != nullptr &&
+        thd->variables.time_zone->get_name() != nullptr) {
+      append_kv("time_zone",
+                thd->variables.time_zone->get_name()->ptr());
+    }
+
+    // foreign_key_checks
+    // OPTION_NO_FOREIGN_KEY_CHECKS set = FK disabled (0), clear = FK enabled (1)
+    append_kv("foreign_key_checks",
+              (thd->variables.option_bits & OPTION_NO_FOREIGN_KEY_CHECKS) ? "0"
+                                                                           : "1");
+
+    // unique_checks
+    append_kv("unique_checks",
+              (thd->variables.option_bits & OPTION_RELAXED_UNIQUE_CHECKS) ? "0"
+                                                                          : "1");
   }
 
   bool is_fallback() const {
@@ -14311,7 +14369,7 @@ static bool mysql_inplace_alter_table(
   DEBUG_SYNC(thd, "alter_table_inplace_after_lock_upgrade");
   THD_STAGE_INFO(thd, stage_alter_inplace_prepare);
   if (brr_ddl_ctx != nullptr && brr_ddl_ctx->is_prepare_ready())
-    brr_ddl_ctx->send_prepare_if_ready();
+    brr_ddl_ctx->send_prepare_if_ready(thd);
 
   switch (inplace_supported) {
     case HA_ALTER_ERROR:
@@ -14379,6 +14437,17 @@ static bool mysql_inplace_alter_table(
     if (table->file->ha_inplace_alter_table(altered_table, ha_alter_info,
                                             table_def, altered_table_def)) {
       goto rollback;
+    }
+
+    /*
+      BRR replica mode: pause after the long-running body and wait for the
+      BRR worker to deliver a COMMIT or ROLLBACK decision from the source.
+    */
+    if (thd->m_brr_ddl_exec_ctx != nullptr) {
+      if (!thd->m_brr_ddl_exec_ctx->wait_for_decision()) {
+        goto rollback;  // BRR worker signalled rollback
+      }
+      // commit: proceed normally to ha_commit_inplace_alter_table(true)
     }
 
     // Upgrade to EXCLUSIVE before commit.

@@ -130,6 +130,7 @@ class Parser_state;
 class PROFILING;
 class Query_tables_list;
 class Relay_log_info;
+struct Brr_ddl_exec_ctx;
 class THD;
 class partition_info;
 class Protocol;
@@ -1623,6 +1624,9 @@ class THD : public MDL_context_owner,
 
   uint32 unmasked_server_id;
   uint32 server_id;
+  /// Non-null when this THD is executing a DDL in BRR replica mode.
+  /// mysql_inplace_alter_table checks this to pause before commit.
+  Brr_ddl_exec_ctx *m_brr_ddl_exec_ctx{nullptr};
   uint32 file_id;  // for LOAD DATA INFILE
   /* remote (peer) port */
   uint16 peer_port;
