@@ -91,6 +91,7 @@ struct Brr_ddl_exec_ctx {
   bool ddl_done{false};           // DDL thread completed execution
   int ddl_error{0};               // error code from DDL thread (0 = success)
   my_thread_handle ddl_thread;    // handle of the DDL execution thread
+  const std::atomic<bool> *worker_abort{nullptr};  // -> m_brr_worker_abort
 
   Master_info *mi{nullptr};       // channel info
 
@@ -130,11 +131,21 @@ struct Brr_ddl_exec_ctx {
 
   /// Called by BRR worker: wait for DDL thread to reach the pause point.
   /// Returns a snapshot of ddl_error taken under the mutex.
+  /// Uses a timed wait (100 ms poll interval) so that STOP REPLICA / IO
+  /// disconnect can interrupt the wait via m_brr_worker_abort.
   int wait_paused() {
     int err;
+    struct timespec abstime;
     mysql_mutex_lock(&mutex);
-    while (!ddl_paused)
-      mysql_cond_wait(&cond_ddl_paused, &mutex);
+    while (!ddl_paused) {
+      // Check for abort (STOP REPLICA, IO disconnect, server shutdown)
+      if (worker_abort != nullptr && worker_abort->load()) {
+        mysql_mutex_unlock(&mutex);
+        return 1;  // non-zero = aborted
+      }
+      set_timespec_nsec(&abstime, 100 * 1000000ULL);  // 100 ms
+      mysql_cond_timedwait(&cond_ddl_paused, &mutex, &abstime);
+    }
     err = ddl_error;
     mysql_mutex_unlock(&mutex);
     return err;

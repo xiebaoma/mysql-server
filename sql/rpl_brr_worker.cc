@@ -51,7 +51,7 @@ static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
 static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
                                const Brr_event &ev,
                                Brr_inflight_ddl *inflight);
-static void process_brr_rollback(THD *thd, Master_info *mi, Relay_log_info *rli,
+static void process_brr_rollback(THD * /*thd*/, Master_info *mi, Relay_log_info *rli,
                                  const Brr_event &ev,
                                  Brr_inflight_ddl *inflight);
 
@@ -215,11 +215,12 @@ static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
                         ev.prepare_dependency_gtid_set.c_str());
 
   /*
-    TODO: make timeout configurable via sys_var.
-    For now use the relay-log-info default timeout, which is large enough
-    for normal replication scenarios.
+    TODO: make timeout configurable via sys_var (e.g.
+    binlog_realtime_replication_dependency_timeout).
+    For now use 0 (infinite wait), relying on thd->killed / abort_slave
+    to break out if the SQL worker stops.
   */
-  double timeout = 0;  // 0 = no timeout (wait indefinitely)
+  double timeout = 0;  // 0 = wait indefinitely
 
   int ret = const_cast<Relay_log_info *>(rli)->wait_for_gtid_set(
       thd, ev.prepare_dependency_gtid_set.c_str(), timeout, false);
@@ -347,7 +348,6 @@ extern "C" void *handle_brr_ddl_exec(void *arg) {
       global_tsid_lock->rdlock();
       if (set_gtid_next(thd, spec)) {
         global_tsid_lock->unlock();
-        ctx->ddl_error = 1;
         sql_print_error(
             "[BRR] Channel '%s': DDL thread failed to acquire GTID ownership",
             mi->get_channel());
@@ -370,7 +370,9 @@ extern "C" void *handle_brr_ddl_exec(void *arg) {
 
     if (ddl_skip) {
       // Signal the BRR worker to avoid deadlock (ddl_paused not set).
+      // Write ddl_error inside the mutex to avoid data race with wait_paused().
       mysql_mutex_lock(&ctx->mutex);
+      ctx->ddl_error = 1;
       ctx->ddl_paused = true;
       mysql_cond_signal(&ctx->cond_ddl_paused);
       mysql_mutex_unlock(&ctx->mutex);
@@ -398,11 +400,12 @@ extern "C" void *handle_brr_ddl_exec(void *arg) {
                                 inflight->prepare_ev.common.ddl_id),
                             inflight->prepare_ev.query.c_str());
 
+      int ddl_error = 0;  // local — write to ctx->ddl_error under mutex later
+
       Parser_state parser_state;
-      ctx->ddl_error = 0;
 
       if (parser_state.init(thd, thd->query().str, thd->query().length)) {
-        ctx->ddl_error = 1;
+        ddl_error = 1;
         sql_print_error("[BRR] Channel '%s': Parser_state init failed for DDL",
                         mi->get_channel());
       } else {
@@ -415,21 +418,29 @@ extern "C" void *handle_brr_ddl_exec(void *arg) {
         dispatch_sql_command(thd, &parser_state);
 
         if (thd->is_error()) {
-          ctx->ddl_error = thd->get_stmt_da()->mysql_errno();
+          ddl_error = thd->get_stmt_da()->mysql_errno();
           sql_print_error(
               "[BRR] Channel '%s': DDL execution failed, error=%d: %s",
-              mi->get_channel(), ctx->ddl_error,
+              mi->get_channel(), ddl_error,
               thd->get_stmt_da()->message_text());
         }
       }
 
       // If the DDL thread didn't reach the pause point (e.g., early error), we
       // still need to signal the BRR worker to avoid deadlock.
+      // Write ctx->ddl_error inside the mutex to avoid data races with the BRR
+      // worker's wait_paused() which reads it under the mutex.
       if (!ctx->ddl_paused) {
-        ctx->ddl_error = ctx->ddl_error ? ctx->ddl_error : 1;
         mysql_mutex_lock(&ctx->mutex);
+        ctx->ddl_error = ddl_error ? ddl_error : 1;
         ctx->ddl_paused = true;
         mysql_cond_signal(&ctx->cond_ddl_paused);
+        mysql_mutex_unlock(&ctx->mutex);
+      } else {
+        // DDL reached the pause point successfully — the pause path sets
+        // ddl_paused under the mutex, so write ddl_error under it too.
+        mysql_mutex_lock(&ctx->mutex);
+        ctx->ddl_error = ddl_error;
         mysql_mutex_unlock(&ctx->mutex);
       }
 
@@ -529,6 +540,7 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
 
   inflight->exec_ctx.init();
   inflight->exec_ctx.mi = mi;
+  inflight->exec_ctx.worker_abort = &rli->m_brr_worker_abort;
 
   my_thread_attr_t attr;
   my_thread_attr_init(&attr);
@@ -558,16 +570,32 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
   int ddl_err = inflight->exec_ctx.wait_paused();
 
   if (ddl_err != 0) {
-    // DDL failed (either before reaching the pause point, or GTID acquire
-    // failed on the DDL thread) — fallback.
-    sql_print_error(
-        "[BRR] Channel '%s': [%s] DDL execution failed (error=%d)",
-        mi->get_channel(), brr_replica_state_name(inflight->state),
-        ddl_err);
-    inflight->fallback_reason = "ddl_body_failed";
-    inflight->state = Brr_replica_state::RPL_FALLBACK;
-    // Wake the DDL thread to clean up (with rollback decision)
+    // check if this is an abort (worker shutdown / IO disconnect) or a DDL
+    // body failure.  In both cases, call signal_decision(false) — it is safe
+    // to call pre-emptively: if the DDL thread hasn't reached the pause point
+    // yet, the signal just sets decision_ready=true and the DDL thread will
+    // pick it up when it arrives at wait_for_decision().  If we don't signal
+    // before my_thread_join(), the DDL thread could reach the pause point
+    // after wait_paused() exited and block forever in wait_for_decision().
+    bool aborted = rli->m_brr_worker_abort.load();
+
     inflight->exec_ctx.signal_decision(false /* rollback */);
+
+    if (aborted) {
+      sql_print_information(
+          "[BRR] Channel '%s': [%s] BRR worker aborted while waiting for "
+          "DDL thread to pause, joining DDL thread",
+          mi->get_channel(), brr_replica_state_name(inflight->state));
+      inflight->fallback_reason = "worker_aborted_during_ddl";
+    } else {
+      sql_print_error(
+          "[BRR] Channel '%s': [%s] DDL execution failed (error=%d)",
+          mi->get_channel(), brr_replica_state_name(inflight->state),
+          ddl_err);
+      inflight->fallback_reason = "ddl_body_failed";
+    }
+
+    inflight->state = Brr_replica_state::RPL_FALLBACK;
     my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
     inflight->exec_ctx.destroy();
     return;
@@ -586,7 +614,7 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
 //  COMMIT / ROLLBACK processing
 // ==========================================================================
 
-static void process_brr_commit(THD *, Master_info *mi, Relay_log_info *rli,
+static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
                                const Brr_event &ev,
                                Brr_inflight_ddl *inflight) {
   inflight->state = Brr_replica_state::RPL_COMMIT_RECEIVED;
@@ -595,9 +623,35 @@ static void process_brr_commit(THD *, Master_info *mi, Relay_log_info *rli,
       mi->get_channel(), brr_replica_state_name(inflight->state),
       static_cast<unsigned long long>(ev.commit.common.ddl_id));
 
-  // TODO: Wait for commit dependency GTID set before signalling commit
+  // --- Wait for commit dependency GTID set ---
+  inflight->state = Brr_replica_state::RPL_WAIT_COMMIT_DEP;
+  if (!ev.commit.commit_dependency_gtid_set.empty()) {
+    sql_print_information(
+        "[BRR] Channel '%s': [%s] Waiting for commit dependency GTID set: %s",
+        mi->get_channel(), brr_replica_state_name(inflight->state),
+        ev.commit.commit_dependency_gtid_set.c_str());
 
-  // Signal the DDL thread to proceed with commit
+    double timeout = 0;  // 0 = wait indefinitely
+    int ret = rli->wait_for_gtid_set(
+        thd, ev.commit.commit_dependency_gtid_set.c_str(), timeout, false);
+
+    if (ret != 0) {
+      sql_print_warning(
+          "[BRR] Channel '%s': [%s] Commit dependency wait failed (ret=%d), "
+          "signalling DDL thread to rollback",
+          mi->get_channel(), brr_replica_state_name(inflight->state), ret);
+      // DDL thread is still waiting at the pause point — signal rollback.
+      inflight->exec_ctx.signal_decision(false /* rollback */);
+      my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+      inflight->exec_ctx.destroy();
+      inflight->fallback_reason = "commit_dependency_timeout";
+      inflight->state = Brr_replica_state::RPL_FALLBACK;
+      return;
+    }
+  }
+
+  // --- Signal the DDL thread to proceed with commit ---
+  inflight->state = Brr_replica_state::RPL_COMMITTING;
   inflight->exec_ctx.signal_decision(true /* commit */);
 
   // Wait for the DDL thread to finish
@@ -650,25 +704,86 @@ static void process_brr_commit(THD *, Master_info *mi, Relay_log_info *rli,
                         static_cast<long long>(inflight->owned_gtid.gno));
 }
 
-static void process_brr_rollback(THD *thd, Master_info *mi, Relay_log_info *,
+static void process_brr_rollback(THD * /*thd*/, Master_info *mi, Relay_log_info *rli,
                                  const Brr_event &ev,
                                  Brr_inflight_ddl *inflight) {
   inflight->state = Brr_replica_state::RPL_ROLLBACK_RECEIVED;
+
+  // Log source error for diagnostics.
   sql_print_information(
       "[BRR] Channel '%s': [%s] ROLLBACK event received, ddl_id=%llu, "
       "source_error=%u",
       mi->get_channel(), brr_replica_state_name(inflight->state),
       static_cast<unsigned long long>(ev.rollback.common.ddl_id),
       ev.rollback.source_error_code);
+  if (!ev.rollback.source_error_message.empty()) {
+    sql_print_error("[BRR] Channel '%s': Source DDL error: %s",
+                    mi->get_channel(),
+                    ev.rollback.source_error_message.c_str());
+  }
 
-  // Signal the DDL thread to rollback
+  // --- allow_fallback check ---
+  // If the source explicitly disallows fallback, the state is unsafe for
+  // the SQL worker to re-execute the original DDL.
+  if (!ev.rollback.allow_fallback) {
+    sql_print_error(
+        "[BRR] Channel '%s': [%s] Source disallows fallback for this DDL, "
+        "aborting",
+        mi->get_channel(), brr_replica_state_name(inflight->state));
+    // Still need to wake the DDL thread with rollback so it cleans up.
+    inflight->exec_ctx.signal_decision(false /* rollback */);
+    my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+    inflight->exec_ctx.destroy();
+    inflight->fallback_reason = "source_disallowed_fallback";
+    inflight->state = Brr_replica_state::RPL_ABORTED;
+    rli->m_brr_worker_abort.store(true);
+    rli->m_brr_queue.abort();
+    return;
+  }
+
+  // --- Signal the DDL thread to rollback ---
+  inflight->state = Brr_replica_state::RPL_ROLLING_BACK;
   inflight->exec_ctx.signal_decision(false /* rollback */);
 
   // Wait for the DDL thread to finish.
-  // The DDL thread releases GTID ownership via its own cleanup path
-  // (ha_commit_inplace_alter_table(false) + owned_gtid cleanup).
+  // The DDL thread goes through:
+  //   goto rollback → ha_commit_inplace_alter_table(false) → trans_rollback
+  // GTID ownership is released in the DDL thread's exit path.
   my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+
+  int ddl_error = inflight->exec_ctx.ddl_error;
   inflight->exec_ctx.destroy();
+
+  if (ddl_error != 0) {
+    sql_print_warning("[BRR] Channel '%s': DDL rollback returned error=%d",
+                      mi->get_channel(), ddl_error);
+  }
+
+  // --- Verify GTID is NOT in gtid_executed ---
+  // If the GTID somehow made it into gtid_executed despite rollback, the
+  // SQL worker will skip the original DDL, leaving the table without the
+  // expected change — a silent data inconsistency.
+  {
+    Gtid gtid;
+    gtid.set(inflight->owned_gtid.sidno, inflight->owned_gtid.gno);
+    global_tsid_lock->rdlock();
+    bool is_executed = gtid_state->is_executed(gtid);
+    global_tsid_lock->unlock();
+
+    if (is_executed) {
+      sql_print_error(
+          "[BRR] Channel '%s': GTID %u:%lld is in gtid_executed after "
+          "rollback.  The SQL worker will skip the original DDL, causing "
+          "data inconsistency.  Aborting.",
+          mi->get_channel(), inflight->owned_gtid.sidno,
+          static_cast<long long>(inflight->owned_gtid.gno));
+      inflight->fallback_reason = "gtid_in_executed_after_rollback";
+      inflight->state = Brr_replica_state::RPL_ABORTED;
+      rli->m_brr_worker_abort.store(true);
+      rli->m_brr_queue.abort();
+      return;
+    }
+  }
 
   inflight->gtid_owned = false;
   inflight->fallback_reason = "source_rolled_back";
@@ -689,7 +804,7 @@ static void process_brr_rollback(THD *thd, Master_info *mi, Relay_log_info *,
    Must be called before the BRR worker exits to ensure the SQL worker
    is not blocked on a GTID that will never be released.
 */
-static void cleanup_in_flight_brr_ddl(THD *thd, Relay_log_info *rli,
+static void cleanup_in_flight_brr_ddl(THD * /*thd*/, Relay_log_info *rli,
                                       Brr_inflight_ddl *inflight) {
   if (inflight == nullptr) {
     rli->m_brr_queue.clear();
@@ -697,12 +812,22 @@ static void cleanup_in_flight_brr_ddl(THD *thd, Relay_log_info *rli,
   }
 
   if (inflight->is_active()) {
-    // Signal the DDL thread to rollback if it's still waiting.
-    // The DDL thread handles its own GTID ownership cleanup.
-    if (inflight->state == Brr_replica_state::RPL_WAIT_SOURCE_RESULT) {
-      inflight->exec_ctx.signal_decision(false /* rollback */);
-      my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
-      inflight->exec_ctx.destroy();
+    switch (inflight->state) {
+      case Brr_replica_state::RPL_WAIT_SOURCE_RESULT:
+      case Brr_replica_state::RPL_COMMIT_RECEIVED:
+      case Brr_replica_state::RPL_WAIT_COMMIT_DEP:
+      case Brr_replica_state::RPL_ROLLBACK_RECEIVED:
+        // DDL thread is waiting at the pause point — signal rollback.
+        inflight->exec_ctx.signal_decision(false /* rollback */);
+        my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+        inflight->exec_ctx.destroy();
+        break;
+
+      default:
+        // RPL_PREPARE_RECEIVED / RPL_VALIDATE / RPL_GTID_OWNING /
+        // RPL_WAIT_PREPARE_DEP / RPL_COMMITTING / RPL_ROLLING_BACK:
+        // no DDL thread running, just clean up state.
+        break;
     }
   }
 
