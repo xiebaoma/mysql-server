@@ -144,6 +144,7 @@
 #include "sql/rpl_mta_submode.h"  // Mts_submode
 #include "sql/rpl_replica.h"      // use_slave_mask
 #include "sql/rpl_reporting.h"
+#include "sql/rpl_brr_event.h"  // opt_binlog_realtime_replication
 #include "sql/rpl_rli.h"      // Relay_log_info
 #include "sql/rpl_rli_pdb.h"  // Slave_job_group
 #include "sql/sp_head.h"      // sp_name
@@ -13450,6 +13451,17 @@ int Gtid_log_event::do_apply_event(Relay_log_info const *rli) {
     spec.type = PRE_GENERATE_GTID;
     spec.gtid.sidno =
         rli->m_assign_gtids_to_anonymous_transactions_info.get_sidno();
+  }
+
+  // If BRR is enabled and this GTID is owned by a BRR worker, isolate the
+  // DDL group so the MTS coordinator doesn't split it across workers while
+  // the BRR worker holds ownership.
+  if (opt_binlog_realtime_replication && spec.type == ASSIGNED_GTID &&
+      spec.gtid.sidno > 0) {
+    gtid_state->lock_sidno(spec.gtid.sidno);
+    if (gtid_state->is_owned(spec.gtid))
+      const_cast<Relay_log_info *>(rli)->curr_group_isolated = true;
+    gtid_state->unlock_sidno(spec.gtid.sidno);
   }
 
   // set_gtid_next releases global_tsid_lock

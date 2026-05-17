@@ -44,8 +44,8 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
                                 const Brr_event &ev,
                                 Brr_inflight_ddl *inflight);
 static bool validate_brr_prepare(const Brr_ddl_prepare_event &ev);
-static Brr_gtid_status own_brr_gtid(THD *thd, const Brr_ddl_prepare_event &ev,
-                                    Gtid *out_gtid);
+static Brr_gtid_status acquire_brr_gtid(THD *thd, const Brr_ddl_prepare_event &ev,
+                                        Gtid *out_gtid);
 static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
                                  const Brr_ddl_prepare_event &ev);
 static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
@@ -138,23 +138,24 @@ static bool validate_brr_prepare(const Brr_ddl_prepare_event &ev) {
 // ==========================================================================
 
 /**
-   Validate the GTID from a BRR PREPARE event.
+   Validate and acquire GTID ownership for a BRR PREPARE event.
 
    Converts source_server_uuid to a sidno, checks that the GTID is not
-   already in gtid_executed, but does NOT acquire ownership on the BRR
-   worker THD.  Ownership will be acquired later on the DDL execution
-   thread's THD (via set_gtid_next) so that GTID ownership follows the
-   THD that actually executes and commits the DDL.
+   already in gtid_executed and not owned by another thread, then acquires
+   ownership on the BRR worker THD.  Ownership is later transferred to
+   the DDL execution thread via Gtid_state::transfer_ownership().
 
-   @param thd      The BRR worker THD (ownership is NOT acquired on it).
+   @param thd      The BRR worker THD (ownership IS acquired on it).
    @param ev       The PREPARE event.
-   @param[out] out_gtid  The validated GTID (only valid on VALID return).
-   @return VALID           — GTID is valid and not yet executed.
-           ALREADY_EXECUTED — GTID is already in gtid_executed (should skip).
-           ERROR           — UUID parse / sidno mapping failed (should fallback).
+   @param[out] out_gtid  The acquired GTID (only valid on VALID return).
+   @return VALID           — GTID acquired on BRR worker THD.
+           ALREADY_EXECUTED — GTID already in gtid_executed (should skip).
+           OWNED_BY_OTHER   — GTID owned by another thread (should fallback).
+           ERROR           — UUID parse / sidno mapping / acquire failed.
 */
-static Brr_gtid_status own_brr_gtid(THD *, const Brr_ddl_prepare_event &ev,
-                                    Gtid *out_gtid) {
+static Brr_gtid_status acquire_brr_gtid(THD *thd,
+                                        const Brr_ddl_prepare_event &ev,
+                                        Gtid *out_gtid) {
   out_gtid->clear();
 
   mysql::gtid::Uuid uuid;
@@ -172,23 +173,43 @@ static Brr_gtid_status own_brr_gtid(THD *, const Brr_ddl_prepare_event &ev,
   }
 
   rpl_gno gno = static_cast<rpl_gno>(ev.common.gtid_gno);
-
-  // Check if the GTID has already been executed (e.g. by the SQL worker).
   Gtid gtid;
   gtid.set(sidno, gno);
-  global_tsid_lock->rdlock();
-  bool already_executed = gtid_state->is_executed(gtid);
-  global_tsid_lock->unlock();
 
-  if (already_executed) {
+  global_tsid_lock->rdlock();
+  gtid_state->lock_sidno(sidno);
+
+  if (gtid_state->is_executed(gtid)) {
+    gtid_state->unlock_sidno(sidno);
+    global_tsid_lock->unlock();
     sql_print_information(
         "[BRR] GTID %u:%lld already executed, will skip DDL", sidno,
         static_cast<long long>(gno));
     return Brr_gtid_status::ALREADY_EXECUTED;
   }
 
+  if (gtid_state->is_owned(gtid)) {
+    gtid_state->unlock_sidno(sidno);
+    global_tsid_lock->unlock();
+    sql_print_warning(
+        "[BRR] GTID %u:%lld is owned by another thread, falling back",
+        sidno, static_cast<long long>(gno));
+    return Brr_gtid_status::OWNED_BY_OTHER;
+  }
+
+  if (gtid_state->acquire_ownership(thd, gtid)) {
+    gtid_state->unlock_sidno(sidno);
+    global_tsid_lock->unlock();
+    sql_print_error("[BRR] GTID %u:%lld acquire_ownership failed", sidno,
+                    static_cast<long long>(gno));
+    return Brr_gtid_status::ERROR;
+  }
+
+  gtid_state->unlock_sidno(sidno);
+  global_tsid_lock->unlock();
+
   out_gtid->set(sidno, gno);
-  sql_print_information("[BRR] GTID %u:%lld is valid and not yet executed",
+  sql_print_information("[BRR] GTID %u:%lld acquired on BRR worker",
                         sidno, static_cast<long long>(gno));
   return Brr_gtid_status::VALID;
 }
@@ -232,6 +253,83 @@ static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
   }
 
   return true;
+}
+
+// ==========================================================================
+//  GTID ownership transfer
+// ==========================================================================
+
+/**
+   Transfer GTID ownership from the BRR worker THD to the DDL execution
+   thread's THD.
+
+   Waits for the DDL thread to signal that its THD is ready, then atomically
+   transfers ownership under global_tsid_lock + SIDNO lock via
+   Gtid_state::transfer_ownership().  The DDL thread is then signalled to
+   proceed with execution.
+
+   @return true on success, false if aborted or the GTID was executed
+           during the transfer window.
+*/
+static bool transfer_gtid_to_ddl_thread(THD *brr_thd,
+                                        Brr_inflight_ddl *inflight) {
+  Brr_ddl_exec_ctx *ctx = &inflight->exec_ctx;
+
+  // Wait for DDL thread to create THD and signal readiness
+  mysql_mutex_lock(&ctx->mutex);
+  while (!ctx->thd_ready) {
+    if (ctx->worker_abort != nullptr && ctx->worker_abort->load()) {
+      ctx->gtid_transferred = true;
+      mysql_cond_signal(&ctx->cond_gtid_transferred);
+      mysql_mutex_unlock(&ctx->mutex);
+      return false;
+    }
+    struct timespec abstime;
+    set_timespec_nsec(&abstime, 100 * 1000000ULL);
+    mysql_cond_timedwait(&ctx->cond_thd_ready, &ctx->mutex, &abstime);
+  }
+  mysql_mutex_unlock(&ctx->mutex);
+
+  // Atomically transfer ownership under rdlock + sidno lock
+  Gtid gtid = inflight->owned_gtid;
+  global_tsid_lock->rdlock();
+  gtid_state->lock_sidno(gtid.sidno);
+
+  // Check that the GTID is still valid (wasn't executed during wait)
+  if (gtid_state->is_executed(gtid)) {
+    // GTID was executed by SQL worker while we were waiting for DDL thread.
+    // Release from BRR worker and wake the DDL thread so it can clean up.
+    gtid_state->update_on_rollback(brr_thd);
+    gtid_state->unlock_sidno(gtid.sidno);
+    global_tsid_lock->unlock();
+    inflight->gtid_owned = false;
+
+    // Wake the DDL thread — it will see owned_gtid.sidno==0 and skip.
+    mysql_mutex_lock(&ctx->mutex);
+    ctx->gtid_transferred = true;
+    mysql_cond_signal(&ctx->cond_gtid_transferred);
+    mysql_mutex_unlock(&ctx->mutex);
+
+    sql_print_information(
+        "[BRR] GTID %u:%lld executed since acquisition, BRR will skip DDL",
+        gtid.sidno, static_cast<long long>(gtid.gno));
+    return false;  // false → BRR worker should treat as skip/COMMITTED
+  }
+
+  gtid_state->transfer_ownership(brr_thd, ctx->ddl_thd, gtid);
+
+  gtid_state->unlock_sidno(gtid.sidno);
+  global_tsid_lock->unlock();
+
+  inflight->gtid_owned = false;  // DDL thread now owns it
+
+  // Signal DDL thread that GTID is transferred
+  mysql_mutex_lock(&ctx->mutex);
+  ctx->gtid_transferred = true;
+  mysql_cond_signal(&ctx->cond_gtid_transferred);
+  mysql_mutex_unlock(&ctx->mutex);
+
+  return true;  // true → DDL thread owns GTID and will execute normally
 }
 
 // ==========================================================================
@@ -337,30 +435,29 @@ extern "C" void *handle_brr_ddl_exec(void *arg) {
     // Apply slave thread options (disables binlog, sets BIG_SELECTS, etc.)
     set_slave_thread_options(thd);
 
-    // Acquire GTID ownership on the DDL THD.  The BRR worker validated
-    // the GTID but did not own it — ownership must be on the THD that
-    // actually executes and commits the DDL so that the normal commit path
-    // adds it to gtid_executed.
+    // Signal the BRR worker that THD is ready for GTID transfer, then
+    // wait for the BRR worker to transfer GTID ownership.  The BRR worker
+    // acquired ownership in advance so the SQL worker cannot steal it.
     bool ddl_skip = false;
     {
-      Gtid_specification spec;
-      spec.set(inflight->owned_gtid.sidno, inflight->owned_gtid.gno);
-      global_tsid_lock->rdlock();
-      if (set_gtid_next(thd, spec)) {
-        global_tsid_lock->unlock();
-        sql_print_error(
-            "[BRR] Channel '%s': DDL thread failed to acquire GTID ownership",
-            mi->get_channel());
-        ddl_skip = true;
-      } else if (thd->owned_gtid.sidno == 0) {
-        // GTID was already executed between validation and now — skip DDL.
-        global_tsid_lock->unlock();
+      mysql_mutex_lock(&ctx->mutex);
+      ctx->ddl_thd = thd;
+      ctx->thd_ready = true;
+      mysql_cond_signal(&ctx->cond_thd_ready);
+      mysql_mutex_unlock(&ctx->mutex);
+
+      // Wait for BRR worker to transfer GTID ownership
+      mysql_mutex_lock(&ctx->mutex);
+      while (!ctx->gtid_transferred)
+        mysql_cond_wait(&ctx->cond_gtid_transferred, &ctx->mutex);
+      mysql_mutex_unlock(&ctx->mutex);
+
+      // Verify GTID was transferred successfully
+      if (thd->owned_gtid.sidno == 0) {
         sql_print_information(
-            "[BRR] Channel '%s': GTID executed since validation, skipping DDL",
+            "[BRR] Channel '%s': GTID not owned after transfer, skipping DDL",
             mi->get_channel());
         ddl_skip = true;
-      } else {
-        global_tsid_lock->unlock();
       }
     }
 
@@ -498,16 +595,16 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
   // Save the prepare event for later stages
   inflight->prepare_ev = pev;
 
-  // --- Stage 3: Validate GTID ---
+  // --- Stage 3: Acquire GTID ownership ---
   inflight->state = Brr_replica_state::RPL_GTID_OWNING;
   {
     Gtid gtid;
-    Brr_gtid_status status = own_brr_gtid(thd, pev, &gtid);
+    Brr_gtid_status status = acquire_brr_gtid(thd, pev, &gtid);
     switch (status) {
       case Brr_gtid_status::VALID:
         inflight->owned_gtid = gtid;
-        // Ownership is NOT held here — the DDL thread acquires on its own THD.
-        inflight->gtid_owned = false;
+        // Ownership is now held by the BRR worker THD.
+        inflight->gtid_owned = true;
         break;
       case Brr_gtid_status::ALREADY_EXECUTED:
         sql_print_information(
@@ -515,9 +612,16 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
             mi->get_channel(), brr_replica_state_name(inflight->state));
         inflight->state = Brr_replica_state::RPL_COMMITTED;
         return;
+      case Brr_gtid_status::OWNED_BY_OTHER:
+        inflight->fallback_reason = "gtid_owned_by_sql_worker";
+        sql_print_warning(
+            "[BRR] Channel '%s': [%s] GTID owned by another thread, fallback",
+            mi->get_channel(), brr_replica_state_name(inflight->state));
+        inflight->state = Brr_replica_state::RPL_FALLBACK;
+        return;
       case Brr_gtid_status::ERROR:
-        inflight->fallback_reason = "gtid_validate_failed";
-        sql_print_warning("[BRR] Channel '%s': [%s] GTID validation failed",
+        inflight->fallback_reason = "gtid_acquire_failed";
+        sql_print_warning("[BRR] Channel '%s': [%s] GTID acquire failed",
                           mi->get_channel(),
                           brr_replica_state_name(inflight->state));
         inflight->state = Brr_replica_state::RPL_FALLBACK;
@@ -564,6 +668,21 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
 
   // Save the handle for later join (COMMIT/ROLLBACK handlers)
   inflight->exec_ctx.ddl_thread = thd_handle;
+
+  // Transfer GTID ownership from BRR worker to DDL thread.
+  // This must happen before wait_paused() because the DDL thread needs
+  // GTID ownership to execute and commit the DDL.
+  if (!transfer_gtid_to_ddl_thread(thd, inflight)) {
+    // GTID was already executed — the DDL thread will skip execution.
+    // Join the DDL thread and go to RPL_COMMITTED.
+    my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+    inflight->exec_ctx.destroy();
+    sql_print_information(
+        "[BRR] Channel '%s': [%s] GTID executed before transfer, skipping",
+        mi->get_channel(), brr_replica_state_name(inflight->state));
+    inflight->state = Brr_replica_state::RPL_COMMITTED;
+    return;
+  }
 
   // Wait for the DDL thread to reach the pause point (after ha_inplace_alter_table).
   // wait_paused() snapshots ddl_error under the mutex to avoid data races.
@@ -804,7 +923,7 @@ static void process_brr_rollback(THD * /*thd*/, Master_info *mi, Relay_log_info 
    Must be called before the BRR worker exits to ensure the SQL worker
    is not blocked on a GTID that will never be released.
 */
-static void cleanup_in_flight_brr_ddl(THD * /*thd*/, Relay_log_info *rli,
+static void cleanup_in_flight_brr_ddl(THD *thd, Relay_log_info *rli,
                                       Brr_inflight_ddl *inflight) {
   if (inflight == nullptr) {
     rli->m_brr_queue.clear();
@@ -818,6 +937,20 @@ static void cleanup_in_flight_brr_ddl(THD * /*thd*/, Relay_log_info *rli,
       case Brr_replica_state::RPL_WAIT_COMMIT_DEP:
       case Brr_replica_state::RPL_ROLLBACK_RECEIVED:
         // DDL thread is waiting at the pause point — signal rollback.
+        // GTID ownership is on the DDL thread, which releases it on exit.
+        inflight->exec_ctx.signal_decision(false /* rollback */);
+        my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
+        inflight->exec_ctx.destroy();
+        break;
+
+      case Brr_replica_state::RPL_EXECUTING:
+        // DDL thread may be waiting for GTID transfer or executing DDL body.
+        // Wake it from the transfer handshake (harmless if already past it)
+        // and signal rollback in case it already reached the pause point.
+        mysql_mutex_lock(&inflight->exec_ctx.mutex);
+        inflight->exec_ctx.gtid_transferred = true;
+        mysql_cond_signal(&inflight->exec_ctx.cond_gtid_transferred);
+        mysql_mutex_unlock(&inflight->exec_ctx.mutex);
         inflight->exec_ctx.signal_decision(false /* rollback */);
         my_thread_join(&inflight->exec_ctx.ddl_thread, nullptr);
         inflight->exec_ctx.destroy();
@@ -826,9 +959,17 @@ static void cleanup_in_flight_brr_ddl(THD * /*thd*/, Relay_log_info *rli,
       default:
         // RPL_PREPARE_RECEIVED / RPL_VALIDATE / RPL_GTID_OWNING /
         // RPL_WAIT_PREPARE_DEP / RPL_COMMITTING / RPL_ROLLING_BACK:
-        // no DDL thread running, just clean up state.
+        // no DDL thread running.  GTID may still be owned by the BRR worker.
         break;
     }
+  }
+
+  // Release GTID if still owned by the BRR worker THD.
+  // This covers: early abort, failed transfer, transfer not yet attempted.
+  if (thd != nullptr && !thd->owned_gtid_is_empty()) {
+    global_tsid_lock->rdlock();
+    gtid_state->update_on_rollback(thd);
+    global_tsid_lock->unlock();
   }
 
   inflight->state = Brr_replica_state::RPL_FALLBACK;
