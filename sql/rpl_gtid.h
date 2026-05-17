@@ -2939,6 +2939,18 @@ class Gtid_state {
   */
   enum_return_status acquire_ownership(THD *thd, const Gtid &gtid);
   /**
+    Transfer GTID ownership from one thread to another atomically.
+
+    The caller must hold global_tsid_lock (any mode) and the SIDNO lock
+    for the GTID's sidno.  Both from_thd and to_thd must belong to the
+    calling thread (no concurrent access).
+
+    @param from_thd  Thread that currently owns the GTID.
+    @param to_thd    Thread that will own the GTID after the call.
+    @param gtid      The GTID to transfer.
+  */
+  void transfer_ownership(THD *from_thd, THD *to_thd, const Gtid &gtid);
+  /**
     This function updates both the THD and the Gtid_state to reflect that
     the transaction set of transactions has ended, and it does this for the
     whole commit group (by following the thd->next_to_commit pointer).

@@ -47,7 +47,7 @@ enum class Brr_replica_state : int {
 };
 
 /// Three-way result of GTID validation.
-enum class Brr_gtid_status { VALID, ALREADY_EXECUTED, ERROR };
+enum class Brr_gtid_status { VALID, ALREADY_EXECUTED, OWNED_BY_OTHER, ERROR };
 
 inline const char *brr_replica_state_name(Brr_replica_state s) {
   switch (s) {
@@ -84,6 +84,8 @@ struct Brr_ddl_exec_ctx {
   mysql_mutex_t mutex;
   mysql_cond_t cond_ddl_paused;   // DDL thread signals when paused
   mysql_cond_t cond_resume;       // BRR worker signals commit/rollback
+  mysql_cond_t cond_thd_ready;    // DDL thread signals THD created
+  mysql_cond_t cond_gtid_transferred;  // BRR worker signals GTID transferred
 
   bool ddl_paused{false};         // DDL thread reached pause point
   bool should_commit{false};      // true = commit, false = rollback
@@ -93,15 +95,24 @@ struct Brr_ddl_exec_ctx {
   my_thread_handle ddl_thread;    // handle of the DDL execution thread
   const std::atomic<bool> *worker_abort{nullptr};  // -> m_brr_worker_abort
 
+  // GTID transfer handshake
+  bool thd_ready{false};          // DDL thread created THD, ready for transfer
+  bool gtid_transferred{false};   // BRR worker has transferred GTID ownership
+  THD *ddl_thd{nullptr};          // DDL thread's THD (set by DDL thread)
+
   Master_info *mi{nullptr};       // channel info
 
   void init() {
     mysql_mutex_init(0, &mutex, MY_MUTEX_INIT_FAST);
     mysql_cond_init(0, &cond_ddl_paused);
     mysql_cond_init(0, &cond_resume);
+    mysql_cond_init(0, &cond_thd_ready);
+    mysql_cond_init(0, &cond_gtid_transferred);
   }
 
   void destroy() {
+    mysql_cond_destroy(&cond_gtid_transferred);
+    mysql_cond_destroy(&cond_thd_ready);
     mysql_cond_destroy(&cond_resume);
     mysql_cond_destroy(&cond_ddl_paused);
     mysql_mutex_destroy(&mutex);
