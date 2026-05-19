@@ -1156,8 +1156,27 @@ extern "C" void *handle_slave_brr(void *arg) {
       rli->m_brr_queue.reset_aborted();
       rli->m_brr_queue.clear_disconnect();
 
-      sql_print_information("[BRR] Channel '%s': BRR worker started",
-                            mi->get_channel());
+      /*
+        BRR state (queue, in-flight DDL context, GTID ownership on the
+        worker THD) is entirely in memory.  After a replica crash:
+
+        - The in-memory state is gone — nothing to recover.
+        - Any uncommitted InnoDB inplace ALTER TABLE changes (e.g. a
+          partially built secondary index) are rolled back by InnoDB
+          crash recovery just like any other uncommitted transaction.
+        - GTID ownership held by the (now dead) BRR worker / DDL thread
+          is cleared because THDs do not survive a restart.
+        - The relay log still contains the original GTID_EVENT +
+          QUERY_EVENT; the SQL worker will apply the DDL normally.
+
+        Therefore we do not need explicit BRR crash recovery — we rely
+        on InnoDB crash recovery + relay-log replay as the fallback.
+      */
+      sql_print_information(
+          "[BRR] Channel '%s': BRR worker started (state is non-persistent; "
+          "relying on InnoDB crash recovery and relay log for cleanup after "
+          "a replica restart)",
+          mi->get_channel());
 
       /*
         Main loop: dequeue BRR events and dispatch based on current state.
