@@ -16,6 +16,8 @@
 #ifndef RPL_BRR_WORKER_H
 #define RPL_BRR_WORKER_H
 
+#include <chrono>
+
 #include "my_thread.h"             // my_thread_handle
 #include "sql/rpl_brr_event.h"  // Brr_ddl_prepare_event
 #include "sql/rpl_gtid.h"       // Gtid
@@ -144,16 +146,33 @@ struct Brr_ddl_exec_ctx {
   /// Returns a snapshot of ddl_error taken under the mutex.
   /// Uses a timed wait (100 ms poll interval) so that STOP REPLICA / IO
   /// disconnect can interrupt the wait via m_brr_worker_abort.
-  int wait_paused() {
+  ///
+  /// @param timeout_seconds  Maximum total wait time; 0 = wait indefinitely.
+  /// @return 0 if DDL thread paused successfully (check ddl_error for the
+  ///         thread's exit code), 1 = abort (STOP REPLICA / shutdown),
+  ///         2 = timeout.
+  int wait_paused(double timeout_seconds = 0) {
     int err;
     struct timespec abstime;
+    auto start = std::chrono::steady_clock::now();
     mysql_mutex_lock(&mutex);
     while (!ddl_paused) {
       // Check for abort (STOP REPLICA, IO disconnect, server shutdown)
       if (worker_abort != nullptr && worker_abort->load()) {
         mysql_mutex_unlock(&mutex);
-        return 1;  // non-zero = aborted
+        return 1;  // aborted
       }
+
+      if (timeout_seconds > 0) {
+        double elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        if (elapsed >= timeout_seconds) {
+          mysql_mutex_unlock(&mutex);
+          return 2;  // timeout (distinct from abort=1)
+        }
+      }
+
       set_timespec_nsec(&abstime, 100 * 1000000ULL);  // 100 ms
       mysql_cond_timedwait(&cond_ddl_paused, &mutex, &abstime);
     }

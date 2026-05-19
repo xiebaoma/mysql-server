@@ -16,6 +16,7 @@
 #ifndef RPL_BRR_QUEUE_H
 #define RPL_BRR_QUEUE_H
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -63,18 +64,33 @@ class Brr_queue {
   }
 
   /**
-   * Blocking dequeue.  Waits until an event is available, the queue is
-   * aborted (STOP REPLICA / shutdown), or the IO thread has disconnected.
+   * Blocking dequeue with optional timeout.  Waits until an event is
+   * available, the queue is aborted (STOP REPLICA / shutdown), the IO
+   * thread has disconnected, or the timeout expires.
    *
-   * @param out  Receives the dequeued event.
-   * @return true on success, false if the worker should wake (abort or
-   *         disconnect).  Caller checks m_brr_worker_abort to distinguish.
+   * @param out             Receives the dequeued event.
+   * @param timeout_seconds Maximum wait time in seconds; 0 = no timeout.
+   * @return true on success, false if the worker should wake (abort,
+   *         disconnect, or timeout).  Caller checks m_brr_worker_abort
+   *         and is_disconnected() to distinguish.
    */
-  bool dequeue_blocking(Brr_event *out) {
+  bool dequeue_blocking(Brr_event *out, double timeout_seconds = 0) {
     std::unique_lock<std::mutex> lock(m_mutex);
-    while (m_queue.empty() && !m_aborted && !m_disconnected)
-      m_cond.wait(lock);
-    if (m_queue.empty()) return false;  // aborted or disconnected
+    if (timeout_seconds > 0) {
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::duration<double>(timeout_seconds);
+      while (m_queue.empty() && !m_aborted && !m_disconnected) {
+        if (m_cond.wait_until(lock, deadline) == std::cv_status::timeout)
+          // Break out of the while-loop on timeout.  The deadline has
+          // already passed — without the break wait_until would return
+          // timeout immediately on every iteration, forming a busy loop.
+          break;
+      }
+    } else {
+      while (m_queue.empty() && !m_aborted && !m_disconnected)
+        m_cond.wait(lock);
+    }
+    if (m_queue.empty()) return false;  // aborted, disconnected, or timeout
     *out = std::move(m_queue.front());
     m_queue.pop();
     return true;
@@ -146,6 +162,11 @@ class Brr_queue {
   bool is_empty() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_queue.empty();
+  }
+
+  bool is_disconnected() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_disconnected;
   }
 
   size_t size() const {

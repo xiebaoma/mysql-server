@@ -57,6 +57,29 @@ static void process_brr_rollback(THD * /*thd*/, Master_info *mi, Relay_log_info 
 
 
 // ==========================================================================
+//  Timeout constants (seconds).
+//  TODO: replace with configurable sys_vars in the observability phase.
+// ==========================================================================
+
+/// Maximum time to wait for prepare-dependency GTID set to be satisfied.
+constexpr double BRR_PREPARE_DEP_WAIT_TIMEOUT = 60.0;
+
+/// Maximum time to wait for commit-dependency GTID set to be satisfied.
+constexpr double BRR_COMMIT_DEP_WAIT_TIMEOUT = 60.0;
+
+/// Maximum time to wait in dequeue_blocking() for a COMMIT / ROLLBACK
+/// event from the source while in RPL_WAIT_SOURCE_RESULT state.
+constexpr double BRR_SOURCE_RESULT_TIMEOUT = 300.0;
+
+/// Maximum time to wait for the DDL execution thread to reach the pause
+/// point (ha_inplace_alter_table / copy phase finishing).
+constexpr double BRR_DDL_EXEC_TIMEOUT = 3600.0;
+
+/// Polling interval used in timed wait loops so that abort / disconnect
+/// signals are visible with bounded latency.
+constexpr double BRR_WAIT_POLL_INTERVAL = 1.0;
+
+// ==========================================================================
 //  Validation helpers (mirrors source-side Brr_source_ddl_context logic)
 // ==========================================================================
 
@@ -236,30 +259,42 @@ static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
                         ev.prepare_dependency_gtid_set.c_str());
 
   /*
-    Use a 1-second timeout so the worker can react to
+    Poll with a short interval so the worker can react to
     m_brr_worker_abort / IO disconnect between polls.
     wait_for_gtid_set returns:
       >=0  — dependency satisfied
-      -1   — timeout (reached the 1 s deadline without the set changing)
+      -1   — timeout (reached the deadline without the set changing)
       -2   — killed / slave stopped / abort_pos_wait changed
   */
-  constexpr double POLL_TIMEOUT = 1.0;
+  auto start = std::chrono::steady_clock::now();
 
   while (true) {
+    double elapsed = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    if (elapsed >= BRR_PREPARE_DEP_WAIT_TIMEOUT) {
+      sql_print_warning(
+          "[BRR] Prepare dependency wait timed out (%.0fs), falling back",
+          BRR_PREPARE_DEP_WAIT_TIMEOUT);
+      return false;
+    }
+
+    // Use the shorter of the polling interval and the remaining total time.
+    double remaining = BRR_PREPARE_DEP_WAIT_TIMEOUT - elapsed;
+    double this_timeout =
+        (BRR_WAIT_POLL_INTERVAL < remaining) ? BRR_WAIT_POLL_INTERVAL
+                                             : remaining;
+
     int ret = const_cast<Relay_log_info *>(rli)->wait_for_gtid_set(
-        thd, ev.prepare_dependency_gtid_set.c_str(), POLL_TIMEOUT, false);
+        thd, ev.prepare_dependency_gtid_set.c_str(), this_timeout, false);
 
     if (ret >= 0) return true;  // dependency satisfied
 
-    // Check whether the worker has been asked to abort (STOP REPLICA
-    // or IO disconnect — signal_disconnect is visible indirectly:
-    // if the IO thread is gone it won't produce new GTIDs, so the
-    // dependency set will never change; the timeout + abort check
-    // gives us a 1 s exit path).
-    if (rli->m_brr_worker_abort.load()) {
+    if (rli->m_brr_worker_abort.load() ||
+        rli->m_brr_queue.is_disconnected()) {
       sql_print_warning(
-          "[BRR] Prepare dependency wait aborted (worker abort), "
-          "falling back");
+          "[BRR] Prepare dependency wait aborted (worker abort or IO "
+          "disconnect), falling back");
       return false;
     }
 
@@ -270,7 +305,7 @@ static bool wait_brr_prepare_dep(THD *thd, Relay_log_info *rli,
       return false;
     }
 
-    // -1 = timeout — loop and retry
+    // -1 = poll interval expired — loop and retry
   }
 }
 
@@ -703,28 +738,32 @@ static void process_brr_prepare(THD *thd, Master_info *mi, Relay_log_info *rli,
     return;
   }
 
-  // Wait for the DDL thread to reach the pause point (after ha_inplace_alter_table).
-  // wait_paused() snapshots ddl_error under the mutex to avoid data races.
-  int ddl_err = inflight->exec_ctx.wait_paused();
+  // Wait for the DDL thread to reach the pause point.
+  // BRR_DDL_EXEC_TIMEOUT (3600 s) bounds long-running DDLs.
+  int ddl_err = inflight->exec_ctx.wait_paused(BRR_DDL_EXEC_TIMEOUT);
 
   if (ddl_err != 0) {
-    // check if this is an abort (worker shutdown / IO disconnect) or a DDL
-    // body failure.  In both cases, call signal_decision(false) — it is safe
-    // to call pre-emptively: if the DDL thread hasn't reached the pause point
-    // yet, the signal just sets decision_ready=true and the DDL thread will
-    // pick it up when it arrives at wait_for_decision().  If we don't signal
-    // before my_thread_join(), the DDL thread could reach the pause point
-    // after wait_paused() exited and block forever in wait_for_decision().
-    bool aborted = rli->m_brr_worker_abort.load();
-
+    // wait_paused() return values: 1 = abort, 2 = timeout, otherwise
+    // the DDL thread finished with a non-zero exit code (ddl_body_failed).
+    // In all cases signal rollback — it is safe to call pre-emptively:
+    // if the DDL thread hasn't reached the pause point yet, the signal
+    // just sets decision_ready=true and the DDL thread will pick it up
+    // when it arrives at wait_for_decision().
     inflight->exec_ctx.signal_decision(false /* rollback */);
 
-    if (aborted) {
+    if (ddl_err == 1) {
       sql_print_information(
           "[BRR] Channel '%s': [%s] BRR worker aborted while waiting for "
           "DDL thread to pause, joining DDL thread",
           mi->get_channel(), brr_replica_state_name(inflight->state));
       inflight->fallback_reason = "worker_aborted_during_ddl";
+    } else if (ddl_err == 2) {
+      sql_print_warning(
+          "[BRR] Channel '%s': [%s] DDL execution timed out (%.0fs), "
+          "signalling rollback",
+          mi->get_channel(), brr_replica_state_name(inflight->state),
+          BRR_DDL_EXEC_TIMEOUT);
+      inflight->fallback_reason = "ddl_exec_timeout";
     } else {
       sql_print_error(
           "[BRR] Channel '%s': [%s] DDL execution failed (error=%d)",
@@ -770,15 +809,32 @@ static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
         ev.commit.commit_dependency_gtid_set.c_str());
 
     /*
-      Use a 1-second timeout so the worker can react to
+      Poll with a short interval so the worker can react to
       m_brr_worker_abort / IO disconnect between polls.
     */
-    constexpr double POLL_TIMEOUT = 1.0;
+    auto start = std::chrono::steady_clock::now();
     bool dep_satisfied = false;
 
     while (true) {
+      double elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+      if (elapsed >= BRR_COMMIT_DEP_WAIT_TIMEOUT) {
+        sql_print_warning(
+            "[BRR] Channel '%s': [%s] Commit dependency wait timed out "
+            "(%.0fs)",
+            mi->get_channel(), brr_replica_state_name(inflight->state),
+            BRR_COMMIT_DEP_WAIT_TIMEOUT);
+        break;
+      }
+
+      double remaining = BRR_COMMIT_DEP_WAIT_TIMEOUT - elapsed;
+      double this_timeout =
+          (BRR_WAIT_POLL_INTERVAL < remaining) ? BRR_WAIT_POLL_INTERVAL
+                                               : remaining;
+
       int ret = rli->wait_for_gtid_set(
-          thd, ev.commit.commit_dependency_gtid_set.c_str(), POLL_TIMEOUT,
+          thd, ev.commit.commit_dependency_gtid_set.c_str(), this_timeout,
           false);
 
       if (ret >= 0) {
@@ -786,7 +842,8 @@ static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
         break;
       }
 
-      if (rli->m_brr_worker_abort.load()) {
+      if (rli->m_brr_worker_abort.load() ||
+          rli->m_brr_queue.is_disconnected()) {
         sql_print_warning(
             "[BRR] Channel '%s': [%s] Commit dependency wait aborted",
             mi->get_channel(), brr_replica_state_name(inflight->state));
@@ -801,7 +858,7 @@ static void process_brr_commit(THD *thd, Master_info *mi, Relay_log_info *rli,
         break;
       }
 
-      // -1 = timeout — loop and retry
+      // -1 = poll interval expired — loop and retry
     }
 
     if (!dep_satisfied) {
@@ -1141,42 +1198,71 @@ extern "C" void *handle_slave_brr(void *arg) {
         }
 
         Brr_event ev;
-        if (!rli->m_brr_queue.dequeue_blocking(&ev)) {
+
+        // When waiting for source result (COMMIT / ROLLBACK), use a timeout
+        // so the worker doesn't block forever if the source never responds.
+        // In all other states wait indefinitely.
+        double dequeue_timeout = 0;
+        if (inflight != nullptr &&
+            inflight->state == Brr_replica_state::RPL_WAIT_SOURCE_RESULT) {
+          dequeue_timeout = BRR_SOURCE_RESULT_TIMEOUT;
+        }
+
+        if (!rli->m_brr_queue.dequeue_blocking(&ev, dequeue_timeout)) {
           if (rli->m_brr_worker_abort.load()) break;  // permanent stop
 
+          if (rli->m_brr_queue.is_disconnected()) {
+            /*
+              IO disconnect — the queue's m_disconnected flag was set by
+              signal_disconnect() in try_to_reconnect().  Drain any stale
+              events from the old connection and clean up the in-flight DDL
+              (if any), then wait for the IO thread to reconnect.
+            */
+            rli->m_brr_queue.drain();
+            if (inflight != nullptr) {
+              if (inflight->is_active()) {
+                cleanup_in_flight_brr_ddl(thd, rli, inflight);
+                inflight->fallback_reason = "io_disconnected";
+                sql_print_information(
+                    "[BRR] Channel '%s': IO disconnected while DDL %llu was "
+                    "in-flight, cleaned up%s%s",
+                    mi->get_channel(),
+                    static_cast<unsigned long long>(
+                        inflight->prepare_ev.common.ddl_id),
+                    inflight->fallback_reason != nullptr ? ", reason: " : "",
+                    inflight->fallback_reason != nullptr
+                        ? inflight->fallback_reason
+                        : "");
+              }
+              inflight = nullptr;
+            }
+            rli->m_brr_queue.clear_disconnect();
+            sql_print_information(
+                "[BRR] Channel '%s': BRR worker waiting for IO reconnect",
+                mi->get_channel());
+            continue;
+          }
+
           /*
-            IO disconnect — the queue's m_disconnected flag was set by
-            signal_disconnect() in try_to_reconnect().  Drain any stale
-            events from the old connection and clean up the in-flight DDL
-            (if any), then wait for the IO thread to reconnect.
+            Timeout — dequeue_blocking() returned false because the timeout
+            expired.  This only fires in RPL_WAIT_SOURCE_RESULT state where
+            we are waiting for a COMMIT / ROLLBACK from the source.  Clean up
+            the in-flight DDL and fall back to the relay-log DDL.
           */
-          rli->m_brr_queue.drain();
           if (inflight != nullptr) {
             if (inflight->is_active()) {
               cleanup_in_flight_brr_ddl(thd, rli, inflight);
-              inflight->fallback_reason = "io_disconnected";
-              sql_print_information(
-                  "[BRR] Channel '%s': IO disconnected while DDL %llu was "
-                  "in-flight, cleaned up%s%s",
+              inflight->fallback_reason = "source_result_timeout";
+              sql_print_warning(
+                  "[BRR] Channel '%s': [%s] Timed out (%.0fs) waiting for "
+                  "source COMMIT/ROLLBACK, falling back",
                   mi->get_channel(),
-                  static_cast<unsigned long long>(
-                      inflight->prepare_ev.common.ddl_id),
-                  inflight->fallback_reason != nullptr ? ", reason: " : "",
-                  inflight->fallback_reason != nullptr
-                      ? inflight->fallback_reason
-                      : "");
+                  brr_replica_state_name(inflight->state),
+                  BRR_SOURCE_RESULT_TIMEOUT);
             }
-            // Always null the pointer after disconnect — a non-active
-            // inflight (e.g. already in FALLBACK / COMMITTED) is stale
-            // and will be handled at the top of the next loop iteration.
+            // Always null after timeout — consistent with disconnect path.
             inflight = nullptr;
           }
-          // Clear disconnect so dequeue_blocking() blocks on next iteration
-          // until the IO thread reconnects and new events arrive.
-          rli->m_brr_queue.clear_disconnect();
-          sql_print_information(
-              "[BRR] Channel '%s': BRR worker waiting for IO reconnect",
-              mi->get_channel());
           continue;
         }
 
