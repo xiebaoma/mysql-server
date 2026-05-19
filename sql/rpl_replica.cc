@@ -5318,6 +5318,16 @@ static int try_to_reconnect(THD *thd, MYSQL *mysql, Master_info *mi,
   });
   thd->clear_active_vio();
   end_server(mysql);
+
+  /*
+    IO thread lost connection — wake the BRR worker so it cleans up
+    any in-flight DDL.  signal_disconnect() wakes dequeue_blocking()
+    without permanently aborting the queue; the worker stays alive and
+    will process new BRR events after the IO thread reconnects.
+  */
+  if (mi->rli->m_brr_worker_running)
+    mi->rli->m_brr_queue.signal_disconnect();
+
   if ((*retry_count)++) {
     if (*retry_count > mi->retry_count) return 1;  // Don't retry forever
     slave_sleep(thd, mi->connect_retry, io_slave_killed, mi);
@@ -5354,6 +5364,19 @@ static int try_to_reconnect(THD *thd, MYSQL *mysql, Master_info *mi,
     LogErr(INFORMATION_LEVEL, ER_REPLICA_KILLED_AFTER_RECONNECT);
     return 1;
   }
+
+  /*
+    IO thread reconnected successfully.  Do NOT call clear_disconnect()
+    here — there is a race where the IO thread could set m_disconnected
+    to true, reconnect, and clear it back to false before the BRR worker
+    wakes up and observes it.  Instead the BRR worker is the sole caller
+    of clear_disconnect() after it drains stale events and cleans up
+    in-flight DDL.
+
+    Any BRR event that arrives before the worker clears the disconnected
+    flag will be rejected by enqueue() and fall back to relay-log DDL,
+    which is safe.
+  */
   return 0;
 }
 
