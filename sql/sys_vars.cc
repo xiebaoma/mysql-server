@@ -103,6 +103,7 @@
 #include "sql/clone_handler.h"
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
 #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
+#include "sql/threadpool/thread_pool.h"
 #include "sql/conn_handler/socket_connection.h"  // MY_BIND_ALL_ADDRESSES
 #include "sql/derror.h"                          // read_texts
 #include "sql/discrete_interval.h"
@@ -3845,13 +3846,56 @@ static Sys_var_ulong Sys_trans_prealloc_size(
     ON_UPDATE(nullptr), DEPRECATED_VAR(""));
 
 static const char *thread_handling_names[] = {
-    "one-thread-per-connection", "no-threads", "loaded-dynamically", nullptr};
+    "one-thread-per-connection", "no-threads", "pool-of-threads",
+    "loaded-dynamically", nullptr};
 static Sys_var_enum Sys_thread_handling(
     "thread_handling",
     "Define threads usage for handling queries, one of "
-    "one-thread-per-connection, no-threads, loaded-dynamically",
+    "one-thread-per-connection, no-threads, pool-of-threads, "
+    "loaded-dynamically",
     READ_ONLY GLOBAL_VAR(Connection_handler_manager::thread_handling),
     CMD_LINE(REQUIRED_ARG), thread_handling_names, DEFAULT(0));
+
+static Sys_var_uint Sys_thread_pool_size(
+    "thread_pool_size",
+    "Number of thread groups in the thread pool. "
+    "A value of 0 (default) auto-detects based on the number of CPUs.",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_pool_size),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 512), DEFAULT(0),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_uint Sys_thread_pool_max_threads(
+    "thread_pool_max_threads",
+    "Maximum allowed number of worker threads in the thread pool",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_max_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 100000), DEFAULT(100000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_ulong Sys_thread_pool_stall_limit(
+    "thread_pool_stall_limit",
+    "Interval between stall checks in milliseconds",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_stall_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(10, 1000000), DEFAULT(500),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_ulong Sys_thread_pool_idle_timeout(
+    "thread_pool_idle_timeout",
+    "Timeout in seconds before an idle worker thread exits",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_idle_timeout),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 3600), DEFAULT(60),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_uint Sys_thread_pool_oversubscribe(
+    "thread_pool_oversubscribe",
+    "Maximum number of active worker threads per group when oversubscribed",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_oversubscribe_par),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 100), DEFAULT(3),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
 
 static Sys_var_charptr Sys_secure_file_priv(
     "secure_file_priv",

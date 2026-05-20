@@ -43,6 +43,7 @@
 #include "sql/conn_handler/channel_info.h"             // Channel_info
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
 #include "sql/conn_handler/plugin_connection_handler.h"  // Plugin_connection_handler
+#include "sql/threadpool/thread_pool.h"
 #include "sql/current_thd.h"
 #include "sql/mysqld.h"        // max_connections
 #include "sql/sql_callback.h"  // MYSQL_CALLBACK
@@ -158,6 +159,23 @@ bool Connection_handler_manager::init() {
     case SCHEDULER_NO_THREADS:
       connection_handler = new (std::nothrow) One_thread_connection_handler();
       break;
+    case SCHEDULER_THREAD_POOL: {
+      Thread_pool_connection_handler *handler =
+          new (std::nothrow) Thread_pool_connection_handler();
+      if (handler == nullptr) {
+        Per_thread_connection_handler::destroy();
+        return true;
+      }
+      Thread_pool *pool = new (std::nothrow) Thread_pool();
+      if (pool == nullptr || pool->init()) {
+        delete handler;
+        delete pool;
+        Per_thread_connection_handler::destroy();
+        return true;
+      }
+      connection_handler = handler;
+      break;
+    }
     default:
       assert(false);
   }
@@ -218,6 +236,12 @@ void Connection_handler_manager::destroy_instance() {
     m_instance = nullptr;
     mysql_mutex_destroy(&LOCK_connection_count);
     mysql_cond_destroy(&COND_connection_count);
+  }
+
+  if (Thread_pool::s_instance != nullptr) {
+    Thread_pool::s_instance->destroy();
+    delete Thread_pool::s_instance;
+    Thread_pool::s_instance = nullptr;
   }
 }
 

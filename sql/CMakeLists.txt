@@ -120,6 +120,7 @@ ADD_CUSTOM_COMMAND(
 ADD_DEFINITIONS(-DMYSQL_SERVER)
 ADD_SUBDIRECTORY(server_component)
 ADD_SUBDIRECTORY(protobuf)
+ADD_SUBDIRECTORY(threadpool)
 
 SET(DD_SOURCES
   dd/collection.cc
@@ -1254,7 +1255,7 @@ ENDIF()
 SET_TARGET_PROPERTIES(mysqld PROPERTIES ENABLE_EXPORTS TRUE)
 TARGET_LINK_LIBRARIES(mysqld
   sql_main sql_gis binlog rpl rpl_source rpl_replica sql_dd mysys
-  minchassis mysql_binlog_event ext::icu)
+  minchassis mysql_binlog_event ext::icu threadpool)
 
 # Add dependency on ldap library, to ensure it is not unloaded
 # when we shutdown the authentication plugin.
