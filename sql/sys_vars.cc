@@ -3897,6 +3897,37 @@ static Sys_var_uint Sys_thread_pool_oversubscribe(
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
     ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
 
+static const char *thread_pool_high_prio_mode_names[] = {
+    "transactions", "statements", "none", nullptr};
+static Sys_var_enum Sys_thread_pool_high_prio_mode(
+    "thread_pool_high_prio_mode",
+    "High priority scheduling mode: transactions (default), statements, or "
+    "none to disable high priority scheduling",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_high_prio_mode),
+    CMD_LINE(REQUIRED_ARG), thread_pool_high_prio_mode_names,
+    DEFAULT(Thread_pool::HIGH_PRIO_MODE_TRANSACTIONS),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr),
+    nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_uint Sys_thread_pool_high_prio_tickets(
+    "thread_pool_high_prio_tickets",
+    "Number of high priority tickets per connection. "
+    "0 disables high priority scheduling. "
+    "Default: 4294967295 (unlimited)",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_high_prio_tickets),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT32_MAX), DEFAULT(UINT32_MAX),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
+static Sys_var_ulong Sys_thread_pool_prio_kickup_timer(
+    "thread_pool_prio_kickup_timer",
+    "Time in milliseconds before a waiting low-priority connection is "
+    "promoted to high priority (aging). 0 disables aging. Default: 1000",
+    READ_ONLY GLOBAL_VAR(Thread_pool::s_prio_kickup_timer),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1000000), DEFAULT(1000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(nullptr), nullptr, sys_var::PARSE_EARLY);
+
 static Sys_var_charptr Sys_secure_file_priv(
     "secure_file_priv",
     "Limit LOAD DATA, SELECT ... OUTFILE, and LOAD_FILE() to files "
