@@ -1,5 +1,4 @@
-/*
-   Copyright (c) 2021, 2025, Oracle and/or its affiliates.
+/* Copyright (c) 2026, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -15,21 +14,34 @@
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License, version 2.0, for more details.
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-#ifndef CHANGE_STREAM_APPLY_CONSTANTS_H_
-#define CHANGE_STREAM_APPLY_CONSTANTS_H_
+#ifndef RPL_BRR_SOURCE_H
+#define RPL_BRR_SOURCE_H
 
-/* masks for start/stop operations on io and sql threads */
-static constexpr unsigned long REPLICA_IO = 1;
-static constexpr unsigned long REPLICA_SQL = 2;
-// We also have SLAVE_FORCE_ALL 4
-static constexpr unsigned long SLAVE_MONITOR = 8;
-static constexpr unsigned long REPLICA_BRR = 16;
+#include <cstddef>
 
-#endif /* CHANGE_STREAM_APPLY_CONSTANTS_H_ */
+struct Brr_event;
+
+/**
+  Enqueue a BRR event to all currently connected dump threads that negotiated
+  BRR capability.
+
+  The source DDL hook calls this after constructing a PREPARE/COMMIT/ROLLBACK
+  event. The return value is the number of sender queues that accepted the
+  event; zero means there is no negotiated recipient or all queues rejected it.
+*/
+size_t brr_source_enqueue_event(const Brr_event &event);
+
+/** True if at least one dump thread is registered for BRR delivery. */
+bool brr_source_has_registered_sender();
+
+/** Number of dump threads currently registered for BRR delivery. */
+size_t brr_source_registered_sender_count();
+
+#endif  // RPL_BRR_SOURCE_H

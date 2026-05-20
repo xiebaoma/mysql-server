@@ -22,7 +22,9 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "sql/rpl_binlog_sender.h"
+
 #include "mysql/binlog/event/codecs/factory.h"
+#include "sql/rpl_brr_event.h"
 
 #include <stdio.h>
 #include <algorithm>
@@ -56,6 +58,7 @@
 #include "sql/mysqld.h"  // global_system_variables ...
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
+#include "sql/rpl_brr_source.h"
 #include "sql/rpl_constants.h"  // BINLOG_DUMP_NON_BLOCK
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_handler.h"    // RUN_HOOK
@@ -213,6 +216,63 @@ static std::chrono::nanoseconds now_in_nanosecs() {
       std::chrono::high_resolution_clock::now().time_since_epoch());
 }
 
+namespace {
+
+std::mutex brr_source_sender_registry_mutex;
+std::vector<Binlog_sender *> brr_source_sender_registry;
+
+void brr_source_wake_dump_threads() {
+  mysql_bin_log.lock_binlog_end_pos();
+  mysql_cond_broadcast(mysql_bin_log.get_log_cond());
+  mysql_bin_log.unlock_binlog_end_pos();
+}
+
+void brr_source_register_sender(Binlog_sender *sender) {
+  if (sender == nullptr || !sender->is_brr_capability_negotiated()) return;
+
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  if (std::find(brr_source_sender_registry.begin(),
+                brr_source_sender_registry.end(),
+                sender) == brr_source_sender_registry.end()) {
+    brr_source_sender_registry.push_back(sender);
+  }
+}
+
+void brr_source_unregister_sender(Binlog_sender *sender) {
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  brr_source_sender_registry.erase(
+      std::remove(brr_source_sender_registry.begin(),
+                  brr_source_sender_registry.end(), sender),
+      brr_source_sender_registry.end());
+}
+
+}  // namespace
+
+size_t brr_source_enqueue_event(const Brr_event &event) {
+  size_t accepted_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+    for (Binlog_sender *sender : brr_source_sender_registry) {
+      if (sender->is_brr_capability_negotiated() &&
+          sender->enqueue_brr_event(event)) {
+        ++accepted_count;
+      }
+    }
+  }
+
+  if (accepted_count > 0) brr_source_wake_dump_threads();
+  return accepted_count;
+}
+
+bool brr_source_has_registered_sender() {
+  return brr_source_registered_sender_count() > 0;
+}
+
+size_t brr_source_registered_sender_count() {
+  std::lock_guard<std::mutex> lock(brr_source_sender_registry_mutex);
+  return brr_source_sender_registry.size();
+}
+
 /**
   Binlog_sender reads events one by one. It uses the preallocated memory
   (A String object) to store all event_data instead of allocating memory when
@@ -302,6 +362,14 @@ void Binlog_sender::init() {
     }
   }
 
+  /*
+    BRR capability negotiation: enabled only when both the replica requested
+    it (via the BRR_CAPABILITY_FLAG in the dump request flags) and the source
+    has binlog_realtime_replication turned on.
+  */
+  m_brr_capability_negotiated =
+      (m_flag & BRR_CAPABILITY_FLAG) && opt_binlog_realtime_replication;
+
   if (check_start_file()) return;
 
   LogErr(INFORMATION_LEVEL, ER_RPL_BINLOG_STARTING_DUMP, thd->thread_id(),
@@ -361,12 +429,22 @@ void Binlog_sender::init() {
         "--sporadic-binlog-dump-fail");
   m_event_count = 0;
 #endif
+
+  if (!has_error() && m_brr_capability_negotiated) {
+    brr_source_register_sender(this);
+    m_brr_registered = true;
+  }
 }
 
 void Binlog_sender::cleanup() {
   DBUG_TRACE;
 
   THD *thd = m_thd;
+
+  if (m_brr_registered) {
+    brr_source_unregister_sender(this);
+    m_brr_registered = false;
+  }
 
   if (m_transmit_started)
     (void)RUN_HOOK(binlog_transmit, transmit_stop, (thd, m_flag));
@@ -583,6 +661,9 @@ int Binlog_sender::send_events(File_reader &reader, my_off_t end_pos) {
     uint32 event_len = 0;
 
     if (unlikely(thd->killed)) return 1;
+
+    /* Send any queued BRR events before the next binlog event. */
+    if (m_brr_capability_negotiated && flush_brr_queue()) return 1;
 
     if (unlikely(read_event(reader, &event_ptr, &event_len))) return 1;
 
@@ -823,6 +904,12 @@ inline int Binlog_sender::wait_with_heartbeat(my_off_t log_pos) {
     }
     mysql_bin_log.unlock_binlog_end_pos();
     Scope_guard lock([]() { mysql_bin_log.lock_binlog_end_pos(); });
+
+    if (m_brr_capability_negotiated && has_pending_brr_events()) {
+      if (flush_brr_queue()) return 1;
+      continue;
+    }
+
 #ifndef NDEBUG
     if (hb_info_counter < 3) {
       LogErr(INFORMATION_LEVEL, ER_RPL_BINLOG_SOURCE_SENDS_HEARTBEAT);
@@ -842,6 +929,11 @@ inline int Binlog_sender::wait_without_heartbeat(my_off_t log_pos) {
   int res = 0;
   while (!stop_waiting_for_update(log_pos)) {
     res = mysql_bin_log.wait_for_update();
+    if (m_brr_capability_negotiated && has_pending_brr_events()) {
+      mysql_bin_log.unlock_binlog_end_pos();
+      Scope_guard lock([]() { mysql_bin_log.lock_binlog_end_pos(); });
+      if (flush_brr_queue()) return 1;
+    }
   }
   return res;
 }
@@ -1526,4 +1618,97 @@ void Binlog_sender::calc_shrink_buffer_size(size_t current_size) {
                static_cast<double>(current_size * PACKET_SHRINK_FACTOR)));
 
   m_new_shrink_size = ALIGN_SIZE(new_size);
+}
+
+// ==========================================================================
+//  BRR event sending
+// ==========================================================================
+
+bool Binlog_sender::enqueue_brr_event(const Brr_event &ev) {
+  if (!m_brr_capability_negotiated) return false;
+
+  size_t max_size = 0;
+  switch (ev.type) {
+    case mysql::binlog::event::BRR_DDL_PREPARE_EVENT:
+      max_size = max_encode_size_prepare(ev.prepare);
+      break;
+    case mysql::binlog::event::BRR_DDL_COMMIT_EVENT:
+      max_size = max_encode_size_commit(ev.commit);
+      break;
+    case mysql::binlog::event::BRR_DDL_ROLLBACK_EVENT:
+      max_size = max_encode_size_rollback(ev.rollback);
+      break;
+    default:
+      return false;
+  }
+  max_size += LOG_EVENT_HEADER_LEN + BINLOG_CHECKSUM_LEN;
+
+  std::vector<unsigned char> buffer(max_size);
+  size_t ev_size = encode_full_brr_event(ev, buffer.data(), max_size,
+                                         event_checksum_on());
+  if (ev_size == 0) return false;
+  buffer.resize(ev_size);
+
+  {
+    std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+    if (m_brr_event_queue.size() >= MAX_BRR_SEND_QUEUE_SIZE) {
+      ++m_brr_queue_rejected_count;
+      return false;
+    }
+    m_brr_event_queue.push(std::move(buffer));
+  }
+  return true;
+}
+
+bool Binlog_sender::has_pending_brr_events() {
+  std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+  return !m_brr_event_queue.empty();
+}
+
+int Binlog_sender::flush_brr_queue() {
+  std::vector<unsigned char> entry;
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(m_brr_queue_mutex);
+      if (m_brr_event_queue.empty()) return 0;
+      entry = std::move(m_brr_event_queue.front());
+      m_brr_event_queue.pop();
+    }
+
+    if (reset_transmit_packet(0, entry.size())) return 1;
+    size_t offset = m_packet.length();
+    m_packet.length(offset + entry.size());
+    memcpy(pointer_cast<unsigned char *>(m_packet.ptr()) + offset, entry.data(),
+           entry.size());
+    if (send_packet_and_flush()) return 1;
+  }
+}
+
+int Binlog_sender::send_brr_event_packet(const Brr_event &ev) {
+  size_t max_size = 0;
+  switch (ev.type) {
+    case mysql::binlog::event::BRR_DDL_PREPARE_EVENT:
+      max_size = max_encode_size_prepare(ev.prepare);
+      break;
+    case mysql::binlog::event::BRR_DDL_COMMIT_EVENT:
+      max_size = max_encode_size_commit(ev.commit);
+      break;
+    case mysql::binlog::event::BRR_DDL_ROLLBACK_EVENT:
+      max_size = max_encode_size_rollback(ev.rollback);
+      break;
+    default:
+      return 1;
+  }
+  max_size += LOG_EVENT_HEADER_LEN + BINLOG_CHECKSUM_LEN;
+
+  if (reset_transmit_packet(0, max_size)) return 1;
+
+  size_t offset = m_packet.length();
+  size_t ev_size = encode_full_brr_event(
+      ev, pointer_cast<unsigned char *>(m_packet.ptr()) + offset,
+      m_packet.alloced_length() - offset, event_checksum_on());
+  if (ev_size == 0) return 1;
+  m_packet.length(offset + ev_size);
+
+  return send_packet_and_flush();
 }

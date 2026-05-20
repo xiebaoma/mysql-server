@@ -1030,7 +1030,7 @@ ADD_LIBRARY(binlog STATIC ${BINLOG_SOURCE})
 TARGET_LINK_LIBRARIES(binlog mysql_binlog_event)
 TARGET_LINK_LIBRARIES(binlog rpl)
 
-SET (RPL_SOURCE rpl_handler.cc rpl_tblmap.cc rpl_context.cc)
+SET (RPL_SOURCE rpl_handler.cc rpl_tblmap.cc rpl_context.cc rpl_brr_event.cc)
 ADD_DEPENDENCIES(binlog GenError)
 ADD_LIBRARY(rpl STATIC ${RPL_SOURCE})
 TARGET_LINK_LIBRARIES(rpl sql_main)
@@ -1040,7 +1040,7 @@ SET (RPL_SOURCE_SRCS rpl_source.cc rpl_binlog_sender.cc binlog_reader.cc)
 ADD_DEPENDENCIES(rpl GenError)
 ADD_LIBRARY(rpl_source STATIC ${RPL_SOURCE_SRCS})
 ADD_DEPENDENCIES(rpl_source GenError)
-TARGET_LINK_LIBRARIES(rpl_source binlog sql_main)
+TARGET_LINK_LIBRARIES(rpl_source binlog sql_main rpl)
 
 SET (RPL_REPLICA_SRCS
   dynamic_ids.cc
@@ -1075,6 +1075,7 @@ SET (RPL_REPLICA_SRCS
   rpl_rli_pdb.cc
   rpl_relay_log_sanitizer.cc
   rpl_replica.cc
+  rpl_brr_worker.cc
   rpl_replica_commit_order_manager.cc
   rpl_replica_until_options.cc
   rpl_sys_key_access.cc
@@ -1085,7 +1086,7 @@ SET (RPL_REPLICA_SRCS
   )
 ADD_STATIC_LIBRARY(rpl_replica ${RPL_REPLICA_SRCS}
   DEPENDENCIES GenError
-  LINK_LIBRARIES binlog sql_main ${RPL_PROTOBUF_LITE_LIB}
+  LINK_LIBRARIES binlog sql_main rpl ${RPL_PROTOBUF_LITE_LIB}
   )
 
 IF(WIN32)

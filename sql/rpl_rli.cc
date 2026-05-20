@@ -238,6 +238,8 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery,
                      MY_MUTEX_INIT_FAST);
     mysql_mutex_init(key_mta_gaq_LOCK, &mts_gaq_LOCK, MY_MUTEX_INIT_FAST);
     mysql_cond_init(key_cond_mta_gaq, &logical_clock_cond);
+    mysql_cond_init(PSI_NOT_INSTRUMENTED, &m_brr_start_cond);
+    mysql_cond_init(PSI_NOT_INSTRUMENTED, &m_brr_stop_cond);
 
     relay_log.init_pthread_objects();
     force_flush_postponed_due_to_split_trans = false;
@@ -320,6 +322,8 @@ Relay_log_info::~Relay_log_info() {
     mysql_mutex_destroy(&mts_temp_table_LOCK);
     mysql_mutex_destroy(&mts_gaq_LOCK);
     mysql_cond_destroy(&logical_clock_cond);
+    mysql_cond_destroy(&m_brr_start_cond);
+    mysql_cond_destroy(&m_brr_stop_cond);
     relay_log.cleanup();
 
     Tsid_map *tsid_map = gtid_set->get_tsid_map();

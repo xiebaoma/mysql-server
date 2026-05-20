@@ -372,6 +372,10 @@ enum Log_event_type {
   HEARTBEAT_LOG_EVENT_V2 = 41,
 
   GTID_TAGGED_LOG_EVENT = 42,
+
+  BRR_DDL_PREPARE_EVENT = 43,
+  BRR_DDL_COMMIT_EVENT = 44,
+  BRR_DDL_ROLLBACK_EVENT = 45,
   /**
     Add new events here - right above this comment!
     Existing events (except ENUM_END_EVENT) should never change their numbers
@@ -398,6 +402,14 @@ struct Log_event_type_helper {
   /// for GTID_LOG_EVENT, GTID_TAGGED_LOG_EVENT and ANONYMOUS_GTID_LOG_EVENT
   inline static bool is_any_gtid_event(const Log_event_type &type) {
     return is_assigned_gtid_event(type) || type == ANONYMOUS_GTID_LOG_EVENT;
+  }
+  /// @brief Helps to identify BRR events - returns true
+  /// for BRR_DDL_PREPARE_EVENT, BRR_DDL_COMMIT_EVENT and
+  /// BRR_DDL_ROLLBACK_EVENT
+  inline static bool is_brr_event(const Log_event_type &type) {
+    return type == BRR_DDL_PREPARE_EVENT ||
+           type == BRR_DDL_COMMIT_EVENT ||
+           type == BRR_DDL_ROLLBACK_EVENT;
   }
 };
 

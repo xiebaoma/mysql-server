@@ -378,6 +378,13 @@ typedef struct MYSQL_RES {
 #define MYSQL_RPL_SKIP_TAGGED_GTIDS (1 << 2)
 
 /**
+ Flag to indicate that the replica supports BRR (Binlog Realtime
+ Replication). Sent by the replica in the COM_BINLOG_DUMP /
+ COM_BINLOG_DUMP_GTID request.
+*/
+#define BRR_CAPABILITY_FLAG (1 << 3)
+
+/**
  Tagged GTIDS are supported starting from below version of MySQL
 */
 #define MYSQL_TAGGED_GTIDS_VERSION_SUPPORT 80300

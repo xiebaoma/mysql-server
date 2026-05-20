@@ -122,6 +122,28 @@ err:
   RETURN_REPORTED_ERROR;
 }
 
+void Gtid_state::transfer_ownership(THD *from_thd, THD *to_thd,
+                                    const Gtid &gtid) {
+  global_tsid_lock->assert_some_lock();
+  gtid_state->assert_sidno_lock_owner(gtid.sidno);
+  assert(from_thd->owned_gtid.equals(gtid));
+  assert(to_thd->owned_gtid.sidno == 0);
+
+  // Remove from old owner
+  owned_gtids.remove_gtid(from_thd->owned_gtid, from_thd->thread_id());
+  from_thd->clear_owned_gtids();
+
+  // Add to new owner
+  owned_gtids.add_gtid_owner(gtid, to_thd->thread_id());
+  to_thd->owned_gtid = gtid;
+  to_thd->owned_tsid = tsid_map->sidno_to_tsid(gtid.sidno);
+  to_thd->rpl_thd_ctx.last_used_gtid_tracker_ctx().set_last_used_gtid(
+      gtid, to_thd->owned_tsid);
+
+  // Set gtid_next on the new owner so gtid_pre_statement_checks() works
+  to_thd->variables.gtid_next.set(gtid.sidno, gtid.gno);
+}
+
 #ifdef HAVE_GTID_NEXT_LIST
 void Gtid_state::lock_owned_sidnos(const THD *thd) {
   if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_GTID_SET)

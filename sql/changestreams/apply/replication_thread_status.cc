@@ -48,6 +48,7 @@ void unlock_slave_threads(Master_info *mi) {
 void init_thread_mask(int *mask, Master_info *mi, bool inverse,
                       bool ignore_monitor_thread) {
   bool set_io = mi->slave_running, set_sql = mi->rli->slave_running;
+  bool set_brr = mi->rli->m_brr_worker_running;
   bool set_monitor{
       Source_IO_monitor::get_instance()->is_monitoring_process_running()};
   int tmp_mask{0};
@@ -55,13 +56,14 @@ void init_thread_mask(int *mask, Master_info *mi, bool inverse,
 
   if (set_io) tmp_mask |= REPLICA_IO;
   if (set_sql) tmp_mask |= REPLICA_SQL;
+  if (set_brr) tmp_mask |= REPLICA_BRR;
   if (!ignore_monitor_thread && set_monitor &&
       mi->is_source_connection_auto_failover()) {
     tmp_mask |= SLAVE_MONITOR;
   }
 
   if (inverse) {
-    tmp_mask ^= (REPLICA_IO | REPLICA_SQL);
+    tmp_mask ^= (REPLICA_IO | REPLICA_SQL | REPLICA_BRR);
     if (!ignore_monitor_thread && mi->is_source_connection_auto_failover()) {
       tmp_mask ^= SLAVE_MONITOR;
     }
