@@ -1,4 +1,5 @@
 #include "sql/threadpool/thread_group.h"
+#include "sql/threadpool/thread_pool.h"
 
 #include <new>
 
