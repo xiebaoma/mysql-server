@@ -52,15 +52,19 @@ void Thread_pool::post_kill_notification_cb(THD *thd) {
       static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
   if (sd == nullptr) return;
 
-  // If the connection is queued, transition to CLOSING so the worker
-  // skips processing when it dequeues it.  The kill flag on the THD
-  // already ensures do_command() will bail out.
-  // TODO(Phase 2): also handle CS_IDLE and CS_WAIT_IO states once the
-  // listener starts registering idle connections for epoll/poll events.
-  int expected = CS_QUEUED;
-  sd->state.compare_exchange_strong(expected, CS_CLOSING,
-                                     std::memory_order_acq_rel,
-                                     std::memory_order_relaxed);
+  // Transition to CLOSING so the worker skips processing.
+  // Try the states the connection is likely to be in:
+  //   CS_QUEUED — waiting in queue, not yet picked up
+  //   CS_ACTIVE — currently being processed by a worker
+  //   CS_IDLE   — idle, waiting for a socket event
+  // The worker's CAS from ACTIVE→IDLE detects CLOSING and forces a close.
+  // TODO(Phase 2): CS_WAIT_IO will be added once the listener is in place.
+  for (int expected : {CS_QUEUED, CS_ACTIVE, CS_IDLE}) {
+    if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed))
+      return;
+  }
 }
 
 bool Thread_pool::init() {
@@ -98,6 +102,16 @@ void Thread_pool::destroy() {
   }
   Connection_handler_manager::event_functions = nullptr;
   s_instance = nullptr;
+}
+
+void Thread_pool::prepare_shutdown() {
+  if (s_instance == nullptr) return;
+  for (uint i = 0; i < s_instance->m_group_count; i++) {
+    Thread_group &group = s_instance->m_groups[i];
+    group.m_shutdown.store(true, std::memory_order_relaxed);
+    group.m_high_priority_queue.signal_all();
+    group.m_low_priority_queue.signal_all();
+  }
 }
 
 /**

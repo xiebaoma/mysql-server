@@ -42,6 +42,10 @@ class Thread_pool {
 
   bool init();
   void destroy();
+
+  // Signal all groups to stop accepting work and start draining queues.
+  // Called from close_connections() before wait_till_no_connection().
+  static void prepare_shutdown();
 };
 
 // Built-in Connection_handler subclass

@@ -35,7 +35,7 @@ class Thread_group {
   std::atomic<ulonglong> m_last_activity_time{0};
 
   // -- shutdown --
-  bool m_shutdown{false};
+  std::atomic<bool> m_shutdown{false};
 
   // -- synchronization --
   mysql_mutex_t m_mutex;

@@ -79,7 +79,9 @@ bool Connection_queue::dequeue(Connection_event *event, int timeout_ms) {
     }
   }
 
-  if (m_shutdown || m_head == nullptr) {
+  // During shutdown (m_shutdown == true), we stop blocking but still
+  // drain any remaining elements.  Only return false when truly empty.
+  if (m_head == nullptr) {
     mysql_mutex_unlock(&m_mutex);
     return false;
   }

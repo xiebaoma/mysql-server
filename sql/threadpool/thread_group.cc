@@ -23,7 +23,7 @@ bool Thread_group::init(uint group_id) {
 }
 
 void Thread_group::destroy() {
-  m_shutdown = true;
+  m_shutdown.store(true, std::memory_order_relaxed);
 
   // Wake all waiters so they can see shutdown and exit.
   m_high_priority_queue.signal_all();
@@ -76,7 +76,7 @@ bool Thread_group::dequeue_connection(Connection_event *event, int timeout_ms) {
 }
 
 void Thread_group::wake_or_create_thread() {
-  if (m_shutdown) return;
+  if (m_shutdown.load(std::memory_order_relaxed)) return;
 
   mysql_mutex_lock(&m_mutex);
   // Create a new worker if we are under the per-group oversubscription limit
@@ -121,25 +121,24 @@ void *Thread_group::worker_main_cdecl(void *arg) {
 void Thread_group::worker_main() {
   const ulong idle_timeout_sec = Thread_pool::s_idle_timeout;
 
-  while (!m_shutdown) {
+  while (true) {
     Connection_event event;
 
     // Wait for a connection with idle timeout.
-    // -1 means block indefinitely, but we use a finite timeout to check
-    // idle_timeout and shutdown periodically.  The actual idle exit is
-    // handled by the timer thread in later phases.
+    // The actual idle exit is handled by the timer thread in later phases.
     int timeout_ms = static_cast<int>(idle_timeout_sec) * 1000;
 
     if (!dequeue_connection(&event, timeout_ms)) {
-      // Timeout or shutdown — loop back to check m_shutdown.
+      // No event dequeued.  If shutting down and the queue is empty,
+      // exit the worker.  Otherwise loop back and retry.
+      if (m_shutdown.load(std::memory_order_relaxed)) return;
       continue;
     }
 
-    if (m_shutdown) {
-      // Dequeued an event just as shutdown was signaled.
-      // Clean it up before exiting so no resources leak.
+    if (m_shutdown.load(std::memory_order_relaxed)) {
+      // Shutdown drain: clean up without starting new work.
       cleanup_event(event);
-      break;
+      continue;
     }
 
     m_last_activity_time.store(my_micro_time(), std::memory_order_relaxed);
@@ -195,11 +194,27 @@ void Thread_group::worker_main() {
     } else {
       // --- Ready connection: THD already exists, socket has data ---
       THD *thd = event.data.thd;
+      Scheduler_data *sd = static_cast<Scheduler_data *>(
+          thd_get_scheduler_data(thd));
+
+      // Check if the connection was killed while queued.
+      if (sd != nullptr &&
+          sd->state.load(std::memory_order_acquire) == CS_CLOSING) {
+        thd_store_globals(thd);
+        if (thd_connection_alive(thd)) {
+          end_connection(thd);
+          close_connection(thd, 0, false, false);
+        }
+        remove_connection_from_list(sd);
+        reset_thread_globals(thd);
+        dec_connection_count();
+        delete sd;
+        delete thd;
+        continue;
+      }
 
       if (thd_connection_alive(thd)) {
         thd_store_globals(thd);
-        Scheduler_data *sd = static_cast<Scheduler_data *>(
-            thd_get_scheduler_data(thd));
         if (sd != nullptr) {
           sd->state.store(CS_ACTIVE, std::memory_order_release);
         }
@@ -207,7 +222,14 @@ void Thread_group::worker_main() {
         bool close = do_command(thd);
 
         if (sd != nullptr) {
-          sd->state.store(CS_IDLE, std::memory_order_release);
+          // Only transition to IDLE if the state is still ACTIVE.
+          // post_kill_notification_cb may have set CS_CLOSING during
+          // do_command(), in which case we must not overwrite it.
+          int expected = CS_ACTIVE;
+          sd->state.compare_exchange_strong(expected, CS_IDLE,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed);
+          if (expected == CS_CLOSING) close = true;
         }
 
         if (close) {
@@ -220,13 +242,12 @@ void Thread_group::worker_main() {
           delete thd;
         }
         // If not closed, the connection goes back to IDLE (listener picks it
-        // up in later phases). For now, the connection is done.
+        // up in later phases).  For now, the connection is done.
       } else {
         // Connection was killed/dropped while in queue.
+        thd_store_globals(thd);
         end_connection(thd);
         close_connection(thd, 0, false, false);
-        Scheduler_data *sd = static_cast<Scheduler_data *>(
-            thd_get_scheduler_data(thd));
         if (sd != nullptr) remove_connection_from_list(sd);
         reset_thread_globals(thd);
         dec_connection_count();
