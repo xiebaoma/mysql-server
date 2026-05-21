@@ -3,7 +3,9 @@
 
 #include <new>
 
+#include "include/my_systime.h"
 #include "include/mysql/thread_pool_priv.h"
+#include "sql/mysqld_thd_manager.h"
 #include "sql/sql_class.h"
 
 bool Thread_group::init(uint group_id) {
@@ -37,23 +39,25 @@ void Thread_group::destroy() {
   mysql_cond_destroy(&m_cond_listener);
 }
 
-void Thread_group::enqueue_connection(Connection_event event) {
+bool Thread_group::enqueue_connection(Connection_event event) {
   // For now, all events go to the low priority queue.
   // High priority scheduling will be added in Phase 4.
-  m_low_priority_queue.enqueue(event);
-  mysql_cond_signal(&m_cond_worker);
+  if (!m_low_priority_queue.enqueue(event)) return false;
+  // The queue's internal cond_signal wakes one waiter — no need to
+  // signal m_cond_worker here (workers block on the queue's condvar).
+  return true;
 }
 
 bool Thread_group::dequeue_connection(Connection_event *event, int timeout_ms) {
   // Try high priority queue first (non-blocking), then low.
   if (m_high_priority_queue.dequeue(event, 0)) {
-    m_dequeue_count++;
+    m_dequeue_count.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
   // Wait on the low priority queue with the requested timeout.
   if (m_low_priority_queue.dequeue(event, timeout_ms)) {
-    m_dequeue_count++;
+    m_dequeue_count.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
@@ -63,12 +67,11 @@ bool Thread_group::dequeue_connection(Connection_event *event, int timeout_ms) {
 void Thread_group::wake_or_create_thread() {
   if (m_shutdown) return;
 
-  // Signal in case a sleeping worker can pick up the event.
-  mysql_cond_signal(&m_cond_worker);
-
   mysql_mutex_lock(&m_mutex);
-  // Create a new worker if no worker is running and we are under the limit.
-  if (m_worker_thread_count == 0 &&
+  // Create a new worker if we are under the per-group oversubscription limit
+  // and under the global max thread cap.  The oversubscribe parameter controls
+  // how many concurrent workers a group may have (default 3, phase 1).
+  if (m_worker_thread_count < static_cast<int>(Thread_pool::s_oversubscribe_par) &&
       m_active_thread_count < MAX_THREADS_PER_GROUP) {
     my_thread_handle handle;
     my_thread_attr_t *attr = get_connection_attrib();
@@ -76,6 +79,7 @@ void Thread_group::wake_or_create_thread() {
     if (my_thread_create(&handle, attr, worker_main_cdecl, this) == 0) {
       m_worker_thread_count++;
       m_active_thread_count++;
+      Global_THD_manager::get_instance()->inc_thread_created();
     }
   }
   mysql_mutex_unlock(&m_mutex);
@@ -122,7 +126,7 @@ void Thread_group::worker_main() {
 
     if (m_shutdown) break;
 
-    m_last_activity_time = 0;  // will be set to current time
+    m_last_activity_time.store(my_micro_time(), std::memory_order_relaxed);
 
     if (event.type == Connection_event_type::NEW_CONNECTION) {
       // --- New connection: create THD, authenticate, execute ---
@@ -205,6 +209,7 @@ void Thread_group::worker_main() {
 }
 
 void Thread_group::add_connection_to_list(Scheduler_data *sd) {
+  mysql_mutex_lock(&m_mutex);
   sd->prev_in_group = nullptr;
   sd->next_in_group = m_connections_head;
   if (m_connections_head != nullptr) {
@@ -213,9 +218,11 @@ void Thread_group::add_connection_to_list(Scheduler_data *sd) {
     m_connections_tail = sd;
   }
   m_connections_head = sd;
+  mysql_mutex_unlock(&m_mutex);
 }
 
 void Thread_group::remove_connection_from_list(Scheduler_data *sd) {
+  mysql_mutex_lock(&m_mutex);
   if (sd->prev_in_group != nullptr) {
     sd->prev_in_group->next_in_group = sd->next_in_group;
   } else {
@@ -228,4 +235,5 @@ void Thread_group::remove_connection_from_list(Scheduler_data *sd) {
   }
   sd->next_in_group = nullptr;
   sd->prev_in_group = nullptr;
+  mysql_mutex_unlock(&m_mutex);
 }

@@ -32,7 +32,7 @@ class Thread_group {
 
   // -- stall detection --
   std::atomic<bool> m_stalled{false};
-  ulonglong m_last_activity_time{0};
+  std::atomic<ulonglong> m_last_activity_time{0};
 
   // -- shutdown --
   bool m_shutdown{false};
@@ -44,15 +44,16 @@ class Thread_group {
 
   // -- connection list --
   // Doubly-linked list of Scheduler_data for all connections in this group.
-  // Protected by m_mutex.
+  // Protected by m_mutex (multiple workers may add/remove concurrently).
   Scheduler_data *m_connections_head{nullptr};
   Scheduler_data *m_connections_tail{nullptr};
 
   bool init(uint group_id);
   void destroy();
 
-  // Enqueue a connection event and wake a worker.
-  void enqueue_connection(Connection_event event);
+  // Enqueue a connection event.
+  // @retval true on success, false on OOM.
+  bool enqueue_connection(Connection_event event);
 
   // Dequeue the next connection event. Blocks with timeout.
   // @param event  [out] The dequeued event
@@ -73,8 +74,8 @@ class Thread_group {
   void remove_connection_from_list(Scheduler_data *sd);
 
   // Progress counters for stall detection.
-  ulonglong m_dequeue_count{0};
-  ulonglong m_last_dequeue_count{0};
+  std::atomic<ulonglong> m_dequeue_count{0};
+  std::atomic<ulonglong> m_last_dequeue_count{0};
 
  private:
   // Helper: create a pool worker thread using the OS.

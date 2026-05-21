@@ -18,8 +18,12 @@ class Connection_queue {
   bool init();
   void destroy();
 
-  /** Add an event to the tail of the queue. Never blocks. */
-  void enqueue(Connection_event event);
+  /**
+    Add an event to the tail of the queue. Never blocks.
+    @retval true  on success
+    @retval false on OOM (allocation failure)
+  */
+  bool enqueue(Connection_event event);
 
   /**
     Remove an event from the head of the queue.

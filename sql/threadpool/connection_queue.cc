@@ -19,12 +19,9 @@ void Connection_queue::destroy() {
   mysql_mutex_lock(&m_mutex);
   m_shutdown = true;
   mysql_cond_broadcast(&m_cond);  // wake blocked dequeuers
-  mysql_mutex_unlock(&m_mutex);
 
-  // Give woken threads a chance to observe shutdown and exit.
-  // Then clean up any remaining elements.
-
-  mysql_mutex_lock(&m_mutex);
+  // Clean up remaining elements while holding the lock,
+  // so no new enqueue can sneak in during the gap.
   Element *elem = m_head;
   while (elem != nullptr) {
     Element *next = elem->next;
@@ -40,9 +37,9 @@ void Connection_queue::destroy() {
   mysql_mutex_destroy(&m_mutex);
 }
 
-void Connection_queue::enqueue(Connection_event event) {
+bool Connection_queue::enqueue(Connection_event event) {
   Element *elem = new (std::nothrow) Element;
-  if (elem == nullptr) return;
+  if (elem == nullptr) return false;
 
   elem->event = event;
   elem->next = nullptr;
@@ -57,6 +54,7 @@ void Connection_queue::enqueue(Connection_event event) {
   m_length.fetch_add(1, std::memory_order_release);
   mysql_cond_signal(&m_cond);
   mysql_mutex_unlock(&m_mutex);
+  return true;
 }
 
 bool Connection_queue::dequeue(Connection_event *event, int timeout_ms) {

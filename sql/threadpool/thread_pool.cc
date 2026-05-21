@@ -3,6 +3,7 @@
 #include <new>
 #include <unistd.h>
 
+#include "include/mysql/thread_pool_priv.h"
 #include "sql/threadpool/threadpool_common.h"
 
 // Static variable definitions
@@ -73,7 +74,12 @@ bool Thread_pool_connection_handler::add_connection(
   event.type = Connection_event_type::NEW_CONNECTION;
   event.data.channel_info = channel_info;
 
-  group.enqueue_connection(event);
+  if (!group.enqueue_connection(event)) {
+    // OOM: connection was already counted by the acceptor.
+    destroy_channel_info(channel_info);
+    dec_connection_count();
+    return true;
+  }
   group.wake_or_create_thread();
 
   return false;
