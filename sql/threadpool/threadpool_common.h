@@ -30,10 +30,14 @@ struct Connection_event {
 
 // Per-THD scheduler data, stored via thd_set_scheduler_data()
 struct Scheduler_data {
-  Thread_group *group;
-  std::atomic<int> state;
-  uint high_prio_tickets;
-  ulonglong queue_enter_time;
+  Thread_group *group{nullptr};
+  std::atomic<int> state{CS_IDLE};
+  uint high_prio_tickets{0};
+  ulonglong queue_enter_time{0};
+
+  // Intrusive linked list pointers for Thread_group::m_connections
+  Scheduler_data *next_in_group{nullptr};
+  Scheduler_data *prev_in_group{nullptr};
 };
 
 #endif  // THREADPOOL_COMMON_INCLUDED

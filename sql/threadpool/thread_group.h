@@ -5,26 +5,81 @@
 
 #include "mysql/psi/mysql_cond.h"
 #include "mysql/psi/mysql_mutex.h"
+#include "my_thread.h"
+
+#include "sql/threadpool/connection_queue.h"
+#include "sql/threadpool/threadpool_common.h"
 
 class Thread_group {
  public:
-  uint m_group_id;
+  static constexpr int MAX_THREADS_PER_GROUP = 4096;
 
+  uint m_group_id{0};
+
+  // -- queues --
+  // High priority: connections with active transactions
+  // Low priority: new connections, idle connections reawakening
+  Connection_queue m_high_priority_queue;
+  Connection_queue m_low_priority_queue;
+
+  // -- thread counts --
+  int m_active_thread_count{0};
+  int m_worker_thread_count{0};
+  int m_listener_thread_count{0};
+
+  // -- I/O waiting count --
+  int m_io_waiting_count{0};
+
+  // -- stall detection --
+  std::atomic<bool> m_stalled{false};
+  std::atomic<ulonglong> m_last_activity_time{0};
+
+  // -- shutdown --
+  bool m_shutdown{false};
+
+  // -- synchronization --
   mysql_mutex_t m_mutex;
   mysql_cond_t m_cond_worker;
   mysql_cond_t m_cond_listener;
 
-  int m_active_thread_count;
-  int m_worker_thread_count;
-  int m_listener_thread_count;
-  int m_io_waiting_count;
-
-  std::atomic<bool> m_stalled;
-  ulonglong m_last_activity_time;
-  bool m_shutdown;
+  // -- connection list --
+  // Doubly-linked list of Scheduler_data for all connections in this group.
+  // Protected by m_mutex (multiple workers may add/remove concurrently).
+  Scheduler_data *m_connections_head{nullptr};
+  Scheduler_data *m_connections_tail{nullptr};
 
   bool init(uint group_id);
   void destroy();
+
+  // Enqueue a connection event.
+  // @retval true on success, false on OOM.
+  bool enqueue_connection(Connection_event event);
+
+  // Dequeue the next connection event. Blocks with timeout.
+  // @param event  [out] The dequeued event
+  // @param timeout_ms  Timeout in ms, < 0 for indefinite, 0 for non-blocking
+  // @retval true  event was dequeued
+  // @retval false timeout or shutdown
+  bool dequeue_connection(Connection_event *event, int timeout_ms);
+
+  // Wake an existing sleeping worker or create a new one.
+  void wake_or_create_thread();
+
+  // Main loop for a worker thread.
+  void worker_main();
+
+  // Add a Scheduler_data to the group's connection list.
+  void add_connection_to_list(Scheduler_data *sd);
+  // Remove a Scheduler_data from the group's connection list.
+  void remove_connection_from_list(Scheduler_data *sd);
+
+  // Progress counters for stall detection.
+  std::atomic<ulonglong> m_dequeue_count{0};
+  std::atomic<ulonglong> m_last_dequeue_count{0};
+
+ private:
+  // Helper: create a pool worker thread using the OS.
+  static void *worker_main_cdecl(void *arg);
 };
 
 #endif  // THREAD_GROUP_INCLUDED
