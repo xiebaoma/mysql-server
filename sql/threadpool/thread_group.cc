@@ -31,6 +31,17 @@ void Thread_group::destroy() {
   mysql_cond_broadcast(&m_cond_worker);
   mysql_cond_broadcast(&m_cond_listener);
 
+  // Drain any events still in the queues and clean up their resources.
+  // After signal_all(), blocked workers will wake and exit; events that
+  // remain in the queues were never dequeued and must be cleaned up here.
+  Connection_event event;
+  while (m_high_priority_queue.dequeue(&event, 0)) {
+    cleanup_event(event);
+  }
+  while (m_low_priority_queue.dequeue(&event, 0)) {
+    cleanup_event(event);
+  }
+
   m_high_priority_queue.destroy();
   m_low_priority_queue.destroy();
 
@@ -124,7 +135,12 @@ void Thread_group::worker_main() {
       continue;
     }
 
-    if (m_shutdown) break;
+    if (m_shutdown) {
+      // Dequeued an event just as shutdown was signaled.
+      // Clean it up before exiting so no resources leak.
+      cleanup_event(event);
+      break;
+    }
 
     m_last_activity_time.store(my_micro_time(), std::memory_order_relaxed);
 
@@ -136,34 +152,45 @@ void Thread_group::worker_main() {
       if (thd == nullptr) {
         destroy_channel_info(channel_info);
         dec_connection_count();
+        increment_aborted_connects();
         continue;
       }
 
-      thd_store_globals(thd);
-      bool error = thd_prepare_connection(thd);
+      // Allocate and attach scheduler data.  On OOM, clean up and abort
+      // this connection (the THD was never added to Global_THD_manager).
+      Scheduler_data *sd = new (std::nothrow) Scheduler_data();
+      if (sd == nullptr) {
+        // Vio was already transferred to THD by create_thd(), so
+        // Channel_info is just a shell — delete it directly.
+        delete channel_info;
+        dec_connection_count();
+        increment_aborted_connects();
+        delete thd;
+        continue;
+      }
+      thd_set_scheduler_data(thd, sd);
 
-      if (!error) {
-        // Set thread pool scheduler data on the THD.
-        Scheduler_data *sd = static_cast<Scheduler_data *>(
-            thd_get_scheduler_data(thd));
-        if (sd != nullptr) {
-          sd->group = this;
-          sd->state.store(CS_ACTIVE, std::memory_order_release);
-          add_connection_to_list(sd);
-        }
+      thd_store_globals(thd);
+
+      if (thd_prepare_connection(thd)) {
+        // Authentication or init_connect failure.
+        increment_aborted_connects();
+      } else {
+        sd->group = this;
+        sd->state.store(CS_ACTIVE, std::memory_order_release);
+        add_connection_to_list(sd);
 
         do_command(thd);
 
-        if (sd != nullptr) {
-          remove_connection_from_list(sd);
-          sd->state.store(CS_IDLE, std::memory_order_release);
-        }
+        remove_connection_from_list(sd);
+        sd->state.store(CS_IDLE, std::memory_order_release);
+        end_connection(thd);
       }
 
-      end_connection(thd);
       close_connection(thd, 0, false, false);
       reset_thread_globals(thd);
       dec_connection_count();
+      delete sd;
       delete thd;
     } else {
       // --- Ready connection: THD already exists, socket has data ---
@@ -189,6 +216,7 @@ void Thread_group::worker_main() {
           if (sd != nullptr) remove_connection_from_list(sd);
           reset_thread_globals(thd);
           dec_connection_count();
+          delete sd;
           delete thd;
         }
         // If not closed, the connection goes back to IDLE (listener picks it
@@ -202,6 +230,7 @@ void Thread_group::worker_main() {
         if (sd != nullptr) remove_connection_from_list(sd);
         reset_thread_globals(thd);
         dec_connection_count();
+        delete sd;
         delete thd;
       }
     }
@@ -236,4 +265,27 @@ void Thread_group::remove_connection_from_list(Scheduler_data *sd) {
   sd->next_in_group = nullptr;
   sd->prev_in_group = nullptr;
   mysql_mutex_unlock(&m_mutex);
+}
+
+void Thread_group::cleanup_event(Connection_event event) {
+  if (event.type == Connection_event_type::NEW_CONNECTION) {
+    destroy_channel_info(event.data.channel_info);
+    dec_connection_count();
+  } else {
+    THD *thd = event.data.thd;
+    if (thd != nullptr) {
+      thd_store_globals(thd);
+      Scheduler_data *sd =
+          static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+      if (sd != nullptr) remove_connection_from_list(sd);
+      if (thd_connection_alive(thd)) {
+        end_connection(thd);
+        close_connection(thd, 0, true, false);
+      }
+      reset_thread_globals(thd);
+      dec_connection_count();
+      delete sd;
+      delete thd;
+    }
+  }
 }

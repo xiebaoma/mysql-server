@@ -28,7 +28,7 @@ class Thread_group {
   int m_listener_thread_count{0};
 
   // -- I/O waiting count --
-  int m_io_waiting_count{0};
+  std::atomic<int> m_io_waiting_count{0};
 
   // -- stall detection --
   std::atomic<bool> m_stalled{false};
@@ -80,6 +80,11 @@ class Thread_group {
  private:
   // Helper: create a pool worker thread using the OS.
   static void *worker_main_cdecl(void *arg);
+
+  // Clean up a connection event, releasing the associated resources.
+  // For NEW_CONNECTION: destroys Channel_info and decrements connection count.
+  // For READY_CONNECTION: closes the THD and decrements connection count.
+  void cleanup_event(Connection_event event);
 };
 
 #endif  // THREAD_GROUP_INCLUDED

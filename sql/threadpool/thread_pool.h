@@ -5,6 +5,7 @@
 
 #include "my_thread.h"
 #include "sql/conn_handler/connection_handler.h"
+#include "sql/conn_handler/connection_handler_manager.h"
 #include "sql/threadpool/thread_group.h"
 
 class Thread_pool {
@@ -32,6 +33,12 @@ class Thread_pool {
 
   my_thread_handle m_timer_thread;
   std::atomic<bool> m_timer_running{false};
+
+  // THD event callbacks registered with Connection_handler_manager.
+  static THD_event_functions s_event_functions;
+  static void thd_wait_begin_cb(THD *thd, int wait_type);
+  static void thd_wait_end_cb(THD *thd);
+  static void post_kill_notification_cb(THD *thd);
 
   bool init();
   void destroy();
