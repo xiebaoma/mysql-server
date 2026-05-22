@@ -22,15 +22,38 @@ jobs:
           libncurses5-dev \
           pkg-config \
           bison \
-          libtirpc-dev
+          libtirpc-dev \
+          ccache
+
+    - name: Setup ccache
+      run: |
+        ccache --set-config=cache_dir=${{ runner.temp }}/.ccache
+        ccache --set-config=max_size=2G
+        ccache --set-config=compression=true
+        ccache --zero-stats
+
+    - name: Cache ccache
+      id: cache-ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/.ccache
+        key: ${{ runner.os }}-ccache-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+          ${{ runner.os }}-
 
     - name: Configure CMake
       run: >
         cmake -B ${{ github.workspace }}/build
         -DCMAKE_C_COMPILER=gcc
         -DCMAKE_CXX_COMPILER=g++
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -S ${{ github.workspace }}
 
     - name: Build
       run: cmake --build ${{ github.workspace }}/build -j$(nproc)
+
+    - name: ccache stats
+      run: ccache --show-stats
