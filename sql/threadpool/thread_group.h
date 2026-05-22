@@ -25,7 +25,7 @@ class Thread_group {
 
   // -- thread counts --
   int m_active_thread_count{0};
-  int m_worker_thread_count{0};
+  std::atomic<int> m_worker_thread_count{0};
   int m_listener_thread_count{0};
 
   // -- I/O waiting count --
@@ -101,6 +101,12 @@ class Thread_group {
   // Progress counters for stall detection.
   std::atomic<ulonglong> m_dequeue_count{0};
   std::atomic<ulonglong> m_last_dequeue_count{0};
+
+  // Last time a worker thread was created (microseconds, for throttling).
+  ulonglong m_last_thread_creation_time{0};
+
+  // Check if this group is stalled.
+  bool check_stall();
 
  private:
   // Helper: create a pool worker thread using the OS.

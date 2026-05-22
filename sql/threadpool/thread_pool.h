@@ -43,6 +43,10 @@ class Thread_pool {
   bool init();
   void destroy();
 
+  // Timer thread for periodic stall detection.
+  static void *timer_main_cdecl(void *arg);
+  void timer_main();
+
   // Signal all groups to stop accepting work and start draining queues.
   // Called from close_connections() before wait_till_no_connection().
   static void prepare_shutdown();

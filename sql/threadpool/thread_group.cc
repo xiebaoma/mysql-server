@@ -112,18 +112,51 @@ void Thread_group::wake_or_create_thread() {
   if (m_shutdown.load(std::memory_order_relaxed)) return;
 
   mysql_mutex_lock(&m_mutex);
-  if (m_worker_thread_count < static_cast<int>(Thread_pool::s_oversubscribe_par) &&
-      m_active_thread_count < MAX_THREADS_PER_GROUP) {
-    my_thread_handle handle;
-    my_thread_attr_t *attr = get_connection_attrib();
 
-    if (my_thread_create(&handle, attr, worker_main_cdecl, this) == 0) {
-      m_worker_thread_count++;
-      m_active_thread_count++;
-      Global_THD_manager::get_instance()->inc_thread_created();
+  // Determine the maximum allowed workers: when stalled, allow up to
+  // 2× oversubscribe so we can break through the stall.
+  int max_workers;
+  if (m_stalled.load(std::memory_order_acquire)) {
+    max_workers = std::min(
+        static_cast<int>(Thread_pool::s_oversubscribe_par) * 2,
+        MAX_THREADS_PER_GROUP);
+  } else {
+    max_workers = static_cast<int>(Thread_pool::s_oversubscribe_par);
+  }
+
+  if (m_worker_thread_count.load(std::memory_order_relaxed) < max_workers &&
+      m_active_thread_count < MAX_THREADS_PER_GROUP) {
+    // Throttle: enforce a minimum interval between consecutive creations.
+    // Interval = stall_limit / 2 (in microseconds), floor 50 ms.
+    ulonglong now = my_micro_time();
+    ulonglong min_interval =
+        std::max((Thread_pool::s_stall_limit * 1000UL) / 2, 50000UL);
+
+    if (m_last_thread_creation_time == 0 ||
+        now - m_last_thread_creation_time > min_interval) {
+
+      my_thread_handle handle;
+      my_thread_attr_t *attr = get_connection_attrib();
+
+      if (my_thread_create(&handle, attr, worker_main_cdecl, this) == 0) {
+        m_worker_thread_count.fetch_add(1, std::memory_order_relaxed);
+        m_active_thread_count++;
+        m_last_thread_creation_time = now;
+        Global_THD_manager::get_instance()->inc_thread_created();
+      }
     }
   }
   mysql_mutex_unlock(&m_mutex);
+}
+
+bool Thread_group::check_stall() {
+  ulonglong current = m_dequeue_count.load(std::memory_order_relaxed);
+  ulonglong last = m_last_dequeue_count.load(std::memory_order_relaxed);
+  m_last_dequeue_count.store(current, std::memory_order_relaxed);
+
+  bool queue_busy = !m_high_priority_queue.is_empty() ||
+                    !m_low_priority_queue.is_empty();
+  return queue_busy && current == last;
 }
 
 // ===================== THD cleanup helper =====================
@@ -229,7 +262,7 @@ void *Thread_group::worker_main_cdecl(void *arg) {
 
   if (my_thread_init()) {
     mysql_mutex_lock(&group->m_mutex);
-    group->m_worker_thread_count--;
+    group->m_worker_thread_count.fetch_sub(1, std::memory_order_relaxed);
     group->m_active_thread_count--;
     mysql_mutex_unlock(&group->m_mutex);
     return nullptr;
@@ -239,7 +272,7 @@ void *Thread_group::worker_main_cdecl(void *arg) {
 
   my_thread_end();
   mysql_mutex_lock(&group->m_mutex);
-  group->m_worker_thread_count--;
+  group->m_worker_thread_count.fetch_sub(1, std::memory_order_relaxed);
   group->m_active_thread_count--;
   mysql_mutex_unlock(&group->m_mutex);
   return nullptr;
@@ -255,6 +288,13 @@ void Thread_group::worker_main() {
 
     if (!dequeue_connection(&event, timeout_ms)) {
       if (m_shutdown.load(std::memory_order_relaxed)) return;
+      // Exit if we have more workers than needed and the group is not
+      // stalled.  This lets the pool shrink after a stall resolves.
+      if (!m_stalled.load(std::memory_order_acquire) &&
+          m_worker_thread_count.load(std::memory_order_acquire) >
+              static_cast<int>(Thread_pool::s_oversubscribe_par)) {
+        return;
+      }
       continue;
     }
 

@@ -1,8 +1,10 @@
 #include "sql/threadpool/thread_pool.h"
 
+#include <algorithm>
 #include <new>
 #include <unistd.h>
 
+#include "include/my_systime.h"
 #include "include/mysql/thread_pool_priv.h"
 #include "sql/threadpool/threadpool_common.h"
 
@@ -109,10 +111,25 @@ bool Thread_pool::init() {
   // Register thread pool event callbacks with the connection handler manager.
   Connection_handler_manager::event_functions = &s_event_functions;
 
+  // Start the timer thread for periodic stall detection.
+  m_timer_running.store(true, std::memory_order_release);
+  if (my_thread_create(&m_timer_thread, get_connection_attrib(),
+                       timer_main_cdecl, this) != 0) {
+    m_timer_running.store(false, std::memory_order_release);
+    destroy();
+    return true;
+  }
+
   return false;
 }
 
 void Thread_pool::destroy() {
+  // Stop the timer thread first since it accesses groups.
+  if (m_timer_running.load(std::memory_order_relaxed)) {
+    m_timer_running.store(false, std::memory_order_release);
+    my_thread_join(&m_timer_thread, nullptr);
+  }
+
   if (m_groups != nullptr) {
     for (uint i = 0; i < m_group_count; i++) {
       m_groups[i].destroy();
@@ -134,6 +151,56 @@ void Thread_pool::prepare_shutdown() {
     group.drain_idle_connections();
     group.m_high_priority_queue.signal_all();
     group.m_low_priority_queue.signal_all();
+  }
+}
+
+void *Thread_pool::timer_main_cdecl(void *arg) {
+  Thread_pool *pool = static_cast<Thread_pool *>(arg);
+  if (my_thread_init()) return nullptr;
+  pool->timer_main();
+  my_thread_end();
+  return nullptr;
+}
+
+void Thread_pool::timer_main() {
+  ulong interval_ms = s_stall_limit;
+  if (interval_ms < 10) interval_ms = 10;
+
+  while (m_timer_running.load(std::memory_order_relaxed)) {
+    // Sleep in 200 ms chunks so shutdown is detected promptly.
+    // Measure actual elapsed time, since my_sleep may be interrupted
+    // early by signals.
+    ulonglong start = my_micro_time();
+    ulonglong deadline = start + interval_ms * 1000ULL;
+    while (m_timer_running.load(std::memory_order_relaxed)) {
+      ulonglong now = my_micro_time();
+      if (now >= deadline) break;
+      ulonglong remaining_us = deadline - now;
+      ulonglong chunk_us = std::min(remaining_us, 200000ULL);
+      my_sleep(chunk_us);
+    }
+
+    if (!m_timer_running.load(std::memory_order_relaxed)) break;
+
+    for (uint i = 0; i < m_group_count; i++) {
+      Thread_group &group = m_groups[i];
+      if (group.m_shutdown.load(std::memory_order_relaxed)) continue;
+
+      if (group.check_stall()) {
+        bool was_stalled =
+            group.m_stalled.exchange(true, std::memory_order_acq_rel);
+        if (!was_stalled) {
+          // Create at most one extra worker per stall episode from the
+          // timer.  If one worker doesn't resolve the stall, adding more
+          // is unlikely to help (the bottleneck is elsewhere).  Additional
+          // workers can still arrive via the add_connection path from the
+          // acceptor thread.
+          group.wake_or_create_thread();
+        }
+      } else {
+        group.m_stalled.store(false, std::memory_order_release);
+      }
+    }
   }
 }
 
