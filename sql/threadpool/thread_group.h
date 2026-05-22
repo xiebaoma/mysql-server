@@ -86,6 +86,13 @@ class Thread_group {
   // Shutdown: enqueue all IDLE connections so workers can drain them.
   void drain_idle_connections();
 
+  // Listener inline cleanup: remove fd, store globals, and tear down a
+  // CS_CLOSING connection.  Caller must have already removed sd from the
+  // connection list.
+  void cleanup_closing_connection(Scheduler_data *sd, bool server_shutdown);
+  // Scan the connection list and clean up all CS_CLOSING connections.
+  void drain_closing_connections();
+
   // Add a Scheduler_data to the group's connection list.
   void add_connection_to_list(Scheduler_data *sd);
   // Remove a Scheduler_data from the group's connection list.

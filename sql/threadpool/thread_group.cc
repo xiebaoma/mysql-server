@@ -180,17 +180,24 @@ void Thread_group::listener_main() {
         continue;
       }
 
-      THD *thd = m_listener.get_event_thd(i);
-      Scheduler_data *sd =
-          static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
-      if (sd == nullptr) continue;
+      // ev.data.ptr stores Scheduler_data* — no THD dereference needed
+      // before state validation, closing the UAF window.
+      Scheduler_data *sd = m_listener.get_event_sd(i);
 
       int expected = CS_IDLE;
       if (!sd->state.compare_exchange_strong(expected, CS_QUEUED,
                                              std::memory_order_acq_rel,
-                                             std::memory_order_relaxed))
+                                             std::memory_order_relaxed)) {
+        // CAS failed — if the connection was killed (CS_CLOSING),
+        // the listener does inline cleanup so no worker participates.
+        if (expected == CS_CLOSING) {
+          remove_connection_from_list(sd);
+          cleanup_closing_connection(sd, false);
+        }
         continue;
+      }
 
+      THD *thd = sd->thd;
       Connection_event event;
       event.type = Connection_event_type::READY_CONNECTION;
       event.data.thd = thd;
@@ -203,7 +210,16 @@ void Thread_group::listener_main() {
       }
       wake_or_create_thread();
     }
+
+    // Drain any CS_CLOSING connections that were marked by KILL during
+    // this epoll_wait / event-processing window but whose fd events
+    // weren't in the batch.
+    drain_closing_connections();
   }
+
+  // Final drain: clean up any CS_CLOSING connections marked during
+  // drain_idle_connections() or the last epoll_wait iteration.
+  drain_closing_connections();
 }
 
 // ===================== Worker thread =====================
@@ -315,10 +331,8 @@ void Thread_group::worker_main() {
             cleanup_thd_connection(thd, sd, false);
           } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
             // KILL arrived between state transition to CS_IDLE and the
-            // fd being registered.  post_kill_notification_cb already
-            // enqueued a READY_CONNECTION event for cleanup — just undo
-            // our fd registration so the listener doesn't see a dangling THD.
-            remove_connection_fd(thd);
+            // fd being registered.  listener handles cleanup via
+            // drain_closing_connections() — no remove_connection_fd needed.
           }
           // Connection stays alive under listener.
         }
@@ -332,7 +346,7 @@ void Thread_group::worker_main() {
             cleanup_thd_connection(thd, sd, false);
           } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
             // KILL arrived between setting CS_IDLE and registering fd.
-            remove_connection_fd(thd);
+            // listener handles cleanup via drain_closing_connections().
           }
         }
       }
@@ -411,7 +425,7 @@ void Thread_group::worker_main() {
           cleanup_thd_connection(thd, sd, false);
         } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
           // KILL arrived between CAS and rearm_fd.
-          remove_connection_fd(thd);
+          // listener handles cleanup via drain_closing_connections().
         }
       }
     }
@@ -433,31 +447,74 @@ bool Thread_group::rearm_connection_fd(THD *thd) {
 }
 
 void Thread_group::drain_idle_connections() {
+  // Mark all CS_IDLE connections as CS_CLOSING so the listener cleans
+  // them up inline (no worker involved).  We don't do cleanup here
+  // because the listener may hold stale Scheduler_data* pointers from
+  // a just-returned epoll_wait batch; having the listener be the sole
+  // owner of CS_IDLE→cleanup transitions closes the UAF window.
   mysql_mutex_lock(&m_mutex);
-  while (m_connections_head != nullptr) {
-    // Find the first CS_IDLE connection in the list.
-    Scheduler_data *sd = m_connections_head;
-    while (sd != nullptr) {
-      int expected = CS_IDLE;
-      if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_relaxed))
-        break;
-      sd = sd->next_in_group;
-    }
-    if (sd == nullptr) break;  // no more IDLE connections
-
-    THD *thd = sd->thd;
-    remove_connection_fd(thd);
-    remove_connection_from_list(sd);
-    mysql_mutex_unlock(&m_mutex);
-
-    thd_store_globals(thd);
-    cleanup_thd_connection(thd, sd, /*server_shutdown=*/true);
-
-    mysql_mutex_lock(&m_mutex);
+  Scheduler_data *sd = m_connections_head;
+  while (sd != nullptr) {
+    int expected = CS_IDLE;
+    sd->state.compare_exchange_strong(expected, CS_CLOSING,
+                                      std::memory_order_acq_rel,
+                                      std::memory_order_relaxed);
+    sd = sd->next_in_group;
   }
   mysql_mutex_unlock(&m_mutex);
+
+  m_listener.wake();
+}
+
+// ===================== Listener inline cleanup =====================
+
+void Thread_group::cleanup_closing_connection(Scheduler_data *sd,
+                                               bool server_shutdown) {
+  THD *thd = sd->thd;
+  remove_connection_fd(thd);
+  thd_store_globals(thd);
+  cleanup_thd_connection(thd, sd, server_shutdown);
+}
+
+void Thread_group::drain_closing_connections() {
+  // Collect all CS_CLOSING sds from the connection list while holding
+  // m_mutex, then clean them up outside the lock.  We batch-remove
+  // from the list here so cleanup_closing_connection doesn't risk
+  // double-removal.
+  Scheduler_data *closing_list = nullptr;
+
+  mysql_mutex_lock(&m_mutex);
+  Scheduler_data *curr = m_connections_head;
+  while (curr != nullptr) {
+    Scheduler_data *next = curr->next_in_group;
+    if (curr->state.load(std::memory_order_acquire) == CS_CLOSING) {
+      // Unlink from the group list.
+      if (curr->prev_in_group != nullptr)
+        curr->prev_in_group->next_in_group = curr->next_in_group;
+      else
+        m_connections_head = curr->next_in_group;
+      if (curr->next_in_group != nullptr)
+        curr->next_in_group->prev_in_group = curr->prev_in_group;
+      else
+        m_connections_tail = curr->prev_in_group;
+
+      curr->next_in_group = closing_list;
+      curr->prev_in_group = nullptr;
+      closing_list = curr;
+    }
+    curr = next;
+  }
+  mysql_mutex_unlock(&m_mutex);
+
+  bool server_shutdown = m_shutdown.load(std::memory_order_relaxed);
+
+  // Now cleanup without holding the lock (cleanup_thd_connection may block).
+  while (closing_list != nullptr) {
+    Scheduler_data *sd = closing_list;
+    closing_list = closing_list->next_in_group;
+    sd->next_in_group = nullptr;
+    cleanup_closing_connection(sd, server_shutdown);
+  }
 }
 
 // ===================== Connection list helpers =====================

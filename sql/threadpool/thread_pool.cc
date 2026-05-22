@@ -73,18 +73,16 @@ void Thread_pool::post_kill_notification_cb(THD *thd) {
   }
 
   // Try CS_IDLE: the connection is waiting for a socket event.
-  // Remove it from the listener's epoll set and enqueue a
-  // READY_CONNECTION event so a worker picks it up and runs cleanup.
+  // EPOLLONESHOT has already disarmed the fd, so no need to call
+  // remove_connection_fd.  Wake the listener so it detects CS_CLOSING
+  // and performs inline cleanup — no worker thread participates,
+  // closing the UAF window between epoll_wait and event processing.
   {
     int expected = CS_IDLE;
     if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
                                           std::memory_order_acq_rel,
                                           std::memory_order_relaxed)) {
-      sd->group->remove_connection_fd(thd);
-      Connection_event ev;
-      ev.type = Connection_event_type::READY_CONNECTION;
-      ev.data.thd = thd;
-      sd->group->enqueue_connection(ev);
+      sd->group->m_listener.wake();
     }
   }
 }

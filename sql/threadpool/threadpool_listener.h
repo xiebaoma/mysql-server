@@ -14,6 +14,7 @@
 */
 
 class THD;
+struct Scheduler_data;
 
 class Threadpool_listener {
  public:
@@ -34,7 +35,7 @@ class Threadpool_listener {
 
   /**
     Wait for socket events with a timeout.  Ready events are stored
-    internally; access them via is_wakeup_event() / get_event_thd().
+    internally; access them via is_wakeup_event() / get_event_sd().
     @param timeout_ms  Timeout in milliseconds.
     @return Number of ready fds (including wakeups), or -1 on error.
   */
@@ -42,8 +43,8 @@ class Threadpool_listener {
 
   /** Returns true if event i is the internal wakeup (not a socket). */
   bool is_wakeup_event(int index) const;
-  /** Returns the THD* associated with event i. */
-  THD *get_event_thd(int index) const;
+  /** Returns the Scheduler_data* associated with event i. */
+  Scheduler_data *get_event_sd(int index) const;
 
   bool is_initialized() const { return m_epoll_fd >= 0; }
 

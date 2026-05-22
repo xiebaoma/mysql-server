@@ -52,9 +52,12 @@ bool Threadpool_listener::register_fd(THD *thd) {
   my_socket s = thd_get_fd(thd);
   int fd = static_cast<int>(s);
 
+  Scheduler_data *sd =
+      static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+
   struct epoll_event ev;
   ev.events = EPOLLIN | EPOLLONESHOT;
-  ev.data.ptr = thd;
+  ev.data.ptr = sd;
 
   return epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0;
 }
@@ -76,9 +79,12 @@ bool Threadpool_listener::rearm_fd(THD *thd) {
   my_socket s = thd_get_fd(thd);
   int fd = static_cast<int>(s);
 
+  Scheduler_data *sd =
+      static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+
   struct epoll_event ev;
   ev.events = EPOLLIN | EPOLLONESHOT;
-  ev.data.ptr = thd;
+  ev.data.ptr = sd;
 
   return epoll_ctl(m_epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0;
 }
@@ -112,8 +118,8 @@ bool Threadpool_listener::is_wakeup_event(int index) const {
   return m_event_ptrs[index] == this;
 }
 
-THD *Threadpool_listener::get_event_thd(int index) const {
-  return static_cast<THD *>(m_event_ptrs[index]);
+Scheduler_data *Threadpool_listener::get_event_sd(int index) const {
+  return static_cast<Scheduler_data *>(m_event_ptrs[index]);
 }
 
 #else  // !__linux__ — poll() fallback stub
@@ -152,7 +158,7 @@ bool Threadpool_listener::is_wakeup_event(int index [[maybe_unused]]) const {
   return false;
 }
 
-THD *Threadpool_listener::get_event_thd(int index [[maybe_unused]]) const {
+Scheduler_data *Threadpool_listener::get_event_sd(int index [[maybe_unused]]) const {
   return nullptr;
 }
 
