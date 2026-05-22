@@ -19,21 +19,49 @@ bool Thread_group::init(uint group_id) {
   mysql_cond_init(0, &m_cond_worker);
   mysql_cond_init(0, &m_cond_listener);
 
+  if (m_listener.init()) {
+    mysql_cond_destroy(&m_cond_listener);
+    mysql_cond_destroy(&m_cond_worker);
+    mysql_mutex_destroy(&m_mutex);
+    m_high_priority_queue.destroy();
+    m_low_priority_queue.destroy();
+    return true;
+  }
+
+  return create_listener();
+}
+
+bool Thread_group::create_listener() {
+  my_thread_attr_t *attr = get_connection_attrib();
+
+  m_listener_running.store(true, std::memory_order_release);
+  if (my_thread_create(&m_listener_handle, attr, listener_main_cdecl,
+                       this) != 0) {
+    m_listener_running.store(false, std::memory_order_release);
+    return true;
+  }
+  mysql_mutex_lock(&m_mutex);
+  m_listener_thread_count++;
+  m_active_thread_count++;
+  mysql_mutex_unlock(&m_mutex);
   return false;
 }
 
 void Thread_group::destroy() {
   m_shutdown.store(true, std::memory_order_relaxed);
 
-  // Wake all waiters so they can see shutdown and exit.
+  // Wake the listener so it can exit its epoll_wait.
+  if (m_listener_running.load(std::memory_order_relaxed)) {
+    m_listener.wake();
+  }
+
+  // Wake all workers blocked on queues.
   m_high_priority_queue.signal_all();
   m_low_priority_queue.signal_all();
   mysql_cond_broadcast(&m_cond_worker);
   mysql_cond_broadcast(&m_cond_listener);
 
-  // Drain any events still in the queues and clean up their resources.
-  // After signal_all(), blocked workers will wake and exit; events that
-  // remain in the queues were never dequeued and must be cleaned up here.
+  // Drain any remaining events from the queues.
   Connection_event event;
   while (m_high_priority_queue.dequeue(&event, 0)) {
     cleanup_event(event);
@@ -41,6 +69,13 @@ void Thread_group::destroy() {
   while (m_low_priority_queue.dequeue(&event, 0)) {
     cleanup_event(event);
   }
+
+  // Join the listener thread before destroying its resources.
+  if (m_listener_running.load(std::memory_order_relaxed)) {
+    my_thread_join(&m_listener_handle, nullptr);
+  }
+
+  m_listener.destroy();
 
   m_high_priority_queue.destroy();
   m_low_priority_queue.destroy();
@@ -54,8 +89,6 @@ bool Thread_group::enqueue_connection(Connection_event event) {
   // For now, all events go to the low priority queue.
   // High priority scheduling will be added in Phase 4.
   if (!m_low_priority_queue.enqueue(event)) return false;
-  // The queue's internal cond_signal wakes one waiter — no need to
-  // signal m_cond_worker here (workers block on the queue's condvar).
   return true;
 }
 
@@ -79,9 +112,6 @@ void Thread_group::wake_or_create_thread() {
   if (m_shutdown.load(std::memory_order_relaxed)) return;
 
   mysql_mutex_lock(&m_mutex);
-  // Create a new worker if we are under the per-group oversubscription limit
-  // and under the global max thread cap.  The oversubscribe parameter controls
-  // how many concurrent workers a group may have (default 3, phase 1).
   if (m_worker_thread_count < static_cast<int>(Thread_pool::s_oversubscribe_par) &&
       m_active_thread_count < MAX_THREADS_PER_GROUP) {
     my_thread_handle handle;
@@ -96,11 +126,92 @@ void Thread_group::wake_or_create_thread() {
   mysql_mutex_unlock(&m_mutex);
 }
 
+// ===================== THD cleanup helper =====================
+
+void Thread_group::cleanup_thd_connection(THD *thd, Scheduler_data *sd,
+                                          bool server_shutdown) {
+  end_connection(thd);
+  close_connection(thd, 0, server_shutdown, false);
+  thd->release_resources();
+  Global_THD_manager::get_instance()->remove_thd(thd);
+  reset_thread_globals(thd);
+  dec_connection_count();
+  delete sd;
+  delete thd;
+}
+
+// ===================== Listener thread =====================
+
+void *Thread_group::listener_main_cdecl(void *arg) {
+  Thread_group *group = static_cast<Thread_group *>(arg);
+
+  if (my_thread_init()) {
+    mysql_mutex_lock(&group->m_mutex);
+    group->m_listener_thread_count--;
+    group->m_active_thread_count--;
+    group->m_listener_running.store(false, std::memory_order_release);
+    mysql_mutex_unlock(&group->m_mutex);
+    return nullptr;
+  }
+
+  group->listener_main();
+
+  my_thread_end();
+  mysql_mutex_lock(&group->m_mutex);
+  group->m_listener_thread_count--;
+  group->m_active_thread_count--;
+  group->m_listener_running.store(false, std::memory_order_release);
+  mysql_mutex_unlock(&group->m_mutex);
+  return nullptr;
+}
+
+void Thread_group::listener_main() {
+  while (!m_shutdown.load(std::memory_order_relaxed)) {
+    int nfds = m_listener.wait(Threadpool_listener::DEFAULT_TIMEOUT_MS);
+
+    if (nfds < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+
+    for (int i = 0; i < nfds; i++) {
+      if (m_listener.is_wakeup_event(i)) {
+        m_listener.ack_wakeup();
+        continue;
+      }
+
+      THD *thd = m_listener.get_event_thd(i);
+      Scheduler_data *sd =
+          static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+      if (sd == nullptr) continue;
+
+      int expected = CS_IDLE;
+      if (!sd->state.compare_exchange_strong(expected, CS_QUEUED,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed))
+        continue;
+
+      Connection_event event;
+      event.type = Connection_event_type::READY_CONNECTION;
+      event.data.thd = thd;
+
+      if (!enqueue_connection(event)) {
+        // OOM: revert to IDLE and rearm so we don't lose the connection.
+        sd->state.store(CS_IDLE, std::memory_order_release);
+        m_listener.rearm_fd(thd);
+        continue;
+      }
+      wake_or_create_thread();
+    }
+  }
+}
+
+// ===================== Worker thread =====================
+
 void *Thread_group::worker_main_cdecl(void *arg) {
   Thread_group *group = static_cast<Thread_group *>(arg);
 
   if (my_thread_init()) {
-    // Thread initialization failed.
     mysql_mutex_lock(&group->m_mutex);
     group->m_worker_thread_count--;
     group->m_active_thread_count--;
@@ -124,19 +235,14 @@ void Thread_group::worker_main() {
   while (true) {
     Connection_event event;
 
-    // Wait for a connection with idle timeout.
-    // The actual idle exit is handled by the timer thread in later phases.
     int timeout_ms = static_cast<int>(idle_timeout_sec) * 1000;
 
     if (!dequeue_connection(&event, timeout_ms)) {
-      // No event dequeued.  If shutting down and the queue is empty,
-      // exit the worker.  Otherwise loop back and retry.
       if (m_shutdown.load(std::memory_order_relaxed)) return;
       continue;
     }
 
     if (m_shutdown.load(std::memory_order_relaxed)) {
-      // Shutdown drain: clean up without starting new work.
       cleanup_event(event);
       continue;
     }
@@ -144,7 +250,7 @@ void Thread_group::worker_main() {
     m_last_activity_time.store(my_micro_time(), std::memory_order_relaxed);
 
     if (event.type == Connection_event_type::NEW_CONNECTION) {
-      // --- New connection: create THD, authenticate, execute ---
+      // ========== NEW_CONNECTION ==========
       Channel_info *channel_info = event.data.channel_info;
 
       THD *thd = create_thd(channel_info);
@@ -155,12 +261,8 @@ void Thread_group::worker_main() {
         continue;
       }
 
-      // Allocate and attach scheduler data.  On OOM, clean up and abort
-      // this connection (the THD was never added to Global_THD_manager).
       Scheduler_data *sd = new (std::nothrow) Scheduler_data();
       if (sd == nullptr) {
-        // Vio was already transferred to THD by create_thd(), so
-        // Channel_info is just a shell — delete it directly.
         delete channel_info;
         dec_connection_count();
         increment_aborted_connects();
@@ -168,95 +270,197 @@ void Thread_group::worker_main() {
         continue;
       }
       thd_set_scheduler_data(thd, sd);
+      sd->thd = thd;
 
       thd_store_globals(thd);
+      Global_THD_manager::get_instance()->add_thd(thd);
 
       if (thd_prepare_connection(thd)) {
-        // Authentication or init_connect failure.
         increment_aborted_connects();
-      } else {
-        sd->group = this;
-        sd->state.store(CS_ACTIVE, std::memory_order_release);
-        add_connection_to_list(sd);
-
-        do_command(thd);
-
-        remove_connection_from_list(sd);
-        sd->state.store(CS_IDLE, std::memory_order_release);
-        end_connection(thd);
+        cleanup_thd_connection(thd, sd, false);
+        continue;
       }
 
-      close_connection(thd, 0, false, false);
-      reset_thread_globals(thd);
-      dec_connection_count();
-      delete sd;
-      delete thd;
-    } else {
-      // --- Ready connection: THD already exists, socket has data ---
-      THD *thd = event.data.thd;
-      Scheduler_data *sd = static_cast<Scheduler_data *>(
-          thd_get_scheduler_data(thd));
+      // Authentication succeeded.
+      sd->group = this;
+      add_connection_to_list(sd);
 
-      // Check if the connection was killed while queued.
-      if (sd != nullptr &&
-          sd->state.load(std::memory_order_acquire) == CS_CLOSING) {
-        thd_store_globals(thd);
-        if (thd_connection_alive(thd)) {
-          end_connection(thd);
-          close_connection(thd, 0, false, false);
+      if (thd_connection_has_data(thd)) {
+        sd->state.store(CS_ACTIVE, std::memory_order_release);
+
+        bool close = do_command(thd);
+
+        int expected = CS_ACTIVE;
+        sd->state.compare_exchange_strong(expected, CS_IDLE,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed);
+        if (expected == CS_CLOSING) close = true;
+
+        if (close || !thd_connection_alive(thd) ||
+            m_shutdown.load(std::memory_order_relaxed)) {
+          remove_connection_from_list(sd);
+          cleanup_thd_connection(thd, sd, false);
+        } else if (thd_connection_has_data(thd)) {
+          sd->state.store(CS_QUEUED, std::memory_order_release);
+          Connection_event reev;
+          reev.type = Connection_event_type::READY_CONNECTION;
+          reev.data.thd = thd;
+          if (!enqueue_connection(reev)) {
+            remove_connection_from_list(sd);
+            cleanup_thd_connection(thd, sd, false);
+          }
+        } else {
+          if (register_connection_fd(thd)) {
+            remove_connection_from_list(sd);
+            cleanup_thd_connection(thd, sd, false);
+          } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
+            // KILL arrived between state transition to CS_IDLE and the
+            // fd being registered.  post_kill_notification_cb already
+            // enqueued a READY_CONNECTION event for cleanup — just undo
+            // our fd registration so the listener doesn't see a dangling THD.
+            remove_connection_fd(thd);
+          }
+          // Connection stays alive under listener.
         }
-        remove_connection_from_list(sd);
+      } else {
+        if (m_shutdown.load(std::memory_order_relaxed)) {
+          remove_connection_from_list(sd);
+          cleanup_thd_connection(thd, sd, true);
+        } else {
+          if (register_connection_fd(thd)) {
+            remove_connection_from_list(sd);
+            cleanup_thd_connection(thd, sd, false);
+          } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
+            // KILL arrived between setting CS_IDLE and registering fd.
+            remove_connection_fd(thd);
+          }
+        }
+      }
+    } else {
+      // ========== READY_CONNECTION ==========
+      THD *thd = event.data.thd;
+      Scheduler_data *sd =
+          static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+
+      if (sd == nullptr) {
+        // Should not happen — every READY_CONNECTION must have scheduler data.
+        // Clean up defensively.
+        thd_store_globals(thd);
+        close_connection(thd, 0, false, false);
+        thd->release_resources();
+        Global_THD_manager::get_instance()->remove_thd(thd);
         reset_thread_globals(thd);
         dec_connection_count();
-        delete sd;
         delete thd;
         continue;
       }
 
-      if (thd_connection_alive(thd)) {
+      // Check if the connection was killed while queued.
+      if (sd->state.load(std::memory_order_acquire) == CS_CLOSING) {
         thd_store_globals(thd);
-        if (sd != nullptr) {
-          sd->state.store(CS_ACTIVE, std::memory_order_release);
-        }
-
-        bool close = do_command(thd);
-
-        if (sd != nullptr) {
-          // Only transition to IDLE if the state is still ACTIVE.
-          // post_kill_notification_cb may have set CS_CLOSING during
-          // do_command(), in which case we must not overwrite it.
-          int expected = CS_ACTIVE;
-          sd->state.compare_exchange_strong(expected, CS_IDLE,
-                                            std::memory_order_release,
-                                            std::memory_order_relaxed);
-          if (expected == CS_CLOSING) close = true;
-        }
-
-        if (close) {
-          end_connection(thd);
-          close_connection(thd, 0, false, false);
-          if (sd != nullptr) remove_connection_from_list(sd);
+        remove_connection_from_list(sd);
+        // KILL may have already called end_connection/close_connection.
+        if (thd_connection_alive(thd)) {
+          cleanup_thd_connection(thd, sd, false);
+        } else {
+          thd->release_resources();
+          Global_THD_manager::get_instance()->remove_thd(thd);
           reset_thread_globals(thd);
           dec_connection_count();
           delete sd;
           delete thd;
         }
-        // If not closed, the connection goes back to IDLE (listener picks it
-        // up in later phases).  For now, the connection is done.
-      } else {
-        // Connection was killed/dropped while in queue.
+        continue;
+      }
+
+      if (!thd_connection_alive(thd)) {
         thd_store_globals(thd);
-        end_connection(thd);
-        close_connection(thd, 0, false, false);
-        if (sd != nullptr) remove_connection_from_list(sd);
-        reset_thread_globals(thd);
-        dec_connection_count();
-        delete sd;
-        delete thd;
+        remove_connection_from_list(sd);
+        cleanup_thd_connection(thd, sd, false);
+        continue;
+      }
+
+      // Connection is alive — process one command.
+      thd_store_globals(thd);
+      sd->state.store(CS_ACTIVE, std::memory_order_release);
+
+      bool close = do_command(thd);
+
+      int expected = CS_ACTIVE;
+      sd->state.compare_exchange_strong(expected, CS_IDLE,
+                                        std::memory_order_release,
+                                        std::memory_order_relaxed);
+      if (expected == CS_CLOSING) close = true;
+
+      if (close || !thd_connection_alive(thd) ||
+          m_shutdown.load(std::memory_order_relaxed)) {
+        remove_connection_from_list(sd);
+        cleanup_thd_connection(thd, sd, false);
+      } else if (thd_connection_has_data(thd)) {
+        sd->state.store(CS_QUEUED, std::memory_order_release);
+        Connection_event reev;
+        reev.type = Connection_event_type::READY_CONNECTION;
+        reev.data.thd = thd;
+        if (!enqueue_connection(reev)) {
+          remove_connection_from_list(sd);
+          cleanup_thd_connection(thd, sd, false);
+        }
+      } else {
+        if (rearm_connection_fd(thd)) {
+          remove_connection_from_list(sd);
+          cleanup_thd_connection(thd, sd, false);
+        } else if (sd->state.load(std::memory_order_acquire) != CS_IDLE) {
+          // KILL arrived between CAS and rearm_fd.
+          remove_connection_fd(thd);
+        }
       }
     }
   }
 }
+
+// ===================== FD management helpers =====================
+
+bool Thread_group::register_connection_fd(THD *thd) {
+  return m_listener.register_fd(thd);
+}
+
+bool Thread_group::remove_connection_fd(THD *thd) {
+  return m_listener.remove_fd(thd);
+}
+
+bool Thread_group::rearm_connection_fd(THD *thd) {
+  return m_listener.rearm_fd(thd);
+}
+
+void Thread_group::drain_idle_connections() {
+  mysql_mutex_lock(&m_mutex);
+  while (m_connections_head != nullptr) {
+    // Find the first CS_IDLE connection in the list.
+    Scheduler_data *sd = m_connections_head;
+    while (sd != nullptr) {
+      int expected = CS_IDLE;
+      if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed))
+        break;
+      sd = sd->next_in_group;
+    }
+    if (sd == nullptr) break;  // no more IDLE connections
+
+    THD *thd = sd->thd;
+    remove_connection_fd(thd);
+    remove_connection_from_list(sd);
+    mysql_mutex_unlock(&m_mutex);
+
+    thd_store_globals(thd);
+    cleanup_thd_connection(thd, sd, /*server_shutdown=*/true);
+
+    mysql_mutex_lock(&m_mutex);
+  }
+  mysql_mutex_unlock(&m_mutex);
+}
+
+// ===================== Connection list helpers =====================
 
 void Thread_group::add_connection_to_list(Scheduler_data *sd) {
   mysql_mutex_lock(&m_mutex);
@@ -298,11 +502,14 @@ void Thread_group::cleanup_event(Connection_event event) {
       thd_store_globals(thd);
       Scheduler_data *sd =
           static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+      remove_connection_fd(thd);
       if (sd != nullptr) remove_connection_from_list(sd);
       if (thd_connection_alive(thd)) {
         end_connection(thd);
         close_connection(thd, 0, true, false);
       }
+      thd->release_resources();
+      Global_THD_manager::get_instance()->remove_thd(thd);
       reset_thread_globals(thd);
       dec_connection_count();
       delete sd;

@@ -30,6 +30,7 @@ struct Connection_event {
 
 // Per-THD scheduler data, stored via thd_set_scheduler_data()
 struct Scheduler_data {
+  THD *thd{nullptr};
   Thread_group *group{nullptr};
   std::atomic<int> state{CS_IDLE};
   uint high_prio_tickets{0};

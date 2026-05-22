@@ -9,6 +9,7 @@
 
 #include "sql/threadpool/connection_queue.h"
 #include "sql/threadpool/threadpool_common.h"
+#include "sql/threadpool/threadpool_listener.h"
 
 class Thread_group {
  public:
@@ -36,6 +37,11 @@ class Thread_group {
 
   // -- shutdown --
   std::atomic<bool> m_shutdown{false};
+
+  // -- listener --
+  Threadpool_listener m_listener;
+  my_thread_handle m_listener_handle;
+  std::atomic<bool> m_listener_running{false};
 
   // -- synchronization --
   mysql_mutex_t m_mutex;
@@ -68,6 +74,18 @@ class Thread_group {
   // Main loop for a worker thread.
   void worker_main();
 
+  // Listener thread lifecycle.
+  bool create_listener();
+  void listener_main();
+
+  // Register / remove / rearm connection fd with the listener.
+  bool register_connection_fd(THD *thd);
+  bool remove_connection_fd(THD *thd);
+  bool rearm_connection_fd(THD *thd);
+
+  // Shutdown: enqueue all IDLE connections so workers can drain them.
+  void drain_idle_connections();
+
   // Add a Scheduler_data to the group's connection list.
   void add_connection_to_list(Scheduler_data *sd);
   // Remove a Scheduler_data from the group's connection list.
@@ -80,6 +98,13 @@ class Thread_group {
  private:
   // Helper: create a pool worker thread using the OS.
   static void *worker_main_cdecl(void *arg);
+  // Helper: create a listener thread using the OS.
+  static void *listener_main_cdecl(void *arg);
+
+  // Helper: full THD teardown.  Caller must have called thd_store_globals(thd)
+  // and removed the connection from the group list beforehand.
+  void cleanup_thd_connection(THD *thd, Scheduler_data *sd,
+                              bool server_shutdown);
 
   // Clean up a connection event, releasing the associated resources.
   // For NEW_CONNECTION: destroys Channel_info and decrements connection count.

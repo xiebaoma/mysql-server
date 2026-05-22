@@ -50,20 +50,42 @@ void Thread_pool::post_kill_notification_cb(THD *thd) {
   if (s_instance == nullptr) return;
   Scheduler_data *sd =
       static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
-  if (sd == nullptr) return;
+  if (sd == nullptr || sd->group == nullptr) return;
 
-  // Transition to CLOSING so the worker skips processing.
-  // Try the states the connection is likely to be in:
-  //   CS_QUEUED — waiting in queue, not yet picked up
-  //   CS_ACTIVE — currently being processed by a worker
-  //   CS_IDLE   — idle, waiting for a socket event
-  // The worker's CAS from ACTIVE→IDLE detects CLOSING and forces a close.
-  // TODO(Phase 2): CS_WAIT_IO will be added once the listener is in place.
-  for (int expected : {CS_QUEUED, CS_ACTIVE, CS_IDLE}) {
+  // Try CS_QUEUED first: the worker's CS_CLOSING check at the top of
+  // READY_CONNECTION will handle cleanup.
+  {
+    int expected = CS_QUEUED;
     if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
                                           std::memory_order_acq_rel,
                                           std::memory_order_relaxed))
       return;
+  }
+
+  // Try CS_ACTIVE: the worker's CAS from ACTIVE→IDLE detects CLOSING
+  // and forces close.
+  {
+    int expected = CS_ACTIVE;
+    if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed))
+      return;
+  }
+
+  // Try CS_IDLE: the connection is waiting for a socket event.
+  // Remove it from the listener's epoll set and enqueue a
+  // READY_CONNECTION event so a worker picks it up and runs cleanup.
+  {
+    int expected = CS_IDLE;
+    if (sd->state.compare_exchange_strong(expected, CS_CLOSING,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed)) {
+      sd->group->remove_connection_fd(thd);
+      Connection_event ev;
+      ev.type = Connection_event_type::READY_CONNECTION;
+      ev.data.thd = thd;
+      sd->group->enqueue_connection(ev);
+    }
   }
 }
 
@@ -109,6 +131,9 @@ void Thread_pool::prepare_shutdown() {
   for (uint i = 0; i < s_instance->m_group_count; i++) {
     Thread_group &group = s_instance->m_groups[i];
     group.m_shutdown.store(true, std::memory_order_relaxed);
+    // Clean up IDLE connections first (inline, no worker needed),
+    // then wake workers to drain any remaining queued events.
+    group.drain_idle_connections();
     group.m_high_priority_queue.signal_all();
     group.m_low_priority_queue.signal_all();
   }
