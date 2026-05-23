@@ -11,7 +11,11 @@
 bool Thread_group::init(uint group_id) {
   m_group_id = group_id;
 
-  if (m_high_priority_queue.init() || m_low_priority_queue.init()) {
+  if (m_high_priority_queue.init()) {
+    return true;
+  }
+  if (m_low_priority_queue.init()) {
+    m_high_priority_queue.destroy();
     return true;
   }
 
@@ -86,9 +90,38 @@ void Thread_group::destroy() {
 }
 
 bool Thread_group::enqueue_connection(Connection_event event) {
-  // For now, all events go to the low priority queue.
-  // High priority scheduling will be added in Phase 4.
+  // Determine if this event should go to the high priority queue.
+  // Only READY_CONNECTION events are eligible (NEW_CONNECTION has no THD yet
+  // and can't be checked for transaction state).
+  bool high_prio = false;
+  Scheduler_data *sd = nullptr;
+
+  if (event.type == Connection_event_type::READY_CONNECTION) {
+    THD *thd = event.data.thd;
+    sd = static_cast<Scheduler_data *>(thd_get_scheduler_data(thd));
+    if (sd != nullptr) {
+      high_prio = determine_high_priority(sd, thd);
+    }
+  }
+
+  if (high_prio) {
+    if (m_high_priority_queue.enqueue(event)) return true;
+    // High queue OOM: refund the ticket that determine_high_priority()
+    // deducted, and fall through to the low queue path below.
+    sd->high_prio_tickets++;
+    high_prio = false;
+  }
+
   if (!m_low_priority_queue.enqueue(event)) return false;
+
+  // Record the time a connection first enters the low priority queue in
+  // this starvation episode.  The timestamp persists across IDLE→LOW→
+  // ACTIVE→IDLE cycles so that connections cycling through low priority
+  // are eventually promoted by the aging check in determine_high_priority().
+  if (sd != nullptr && !high_prio && sd->queue_enter_time == 0) {
+    sd->queue_enter_time = my_micro_time();
+  }
+
   return true;
 }
 
@@ -99,11 +132,79 @@ bool Thread_group::dequeue_connection(Connection_event *event, int timeout_ms) {
     return true;
   }
 
-  // Wait on the low priority queue with the requested timeout.
-  if (m_low_priority_queue.dequeue(event, timeout_ms)) {
+  // Low Queue throttling: when high-priority events are waiting and we
+  // have enough active workers (at or above oversubscribe_par), skip the
+  // low queue so workers preferentially handle high-priority connections.
+  // This lets transaction holders complete and release locks before new
+  // transactions are started.
+  // Use 1 ms rather than 0 to prevent a tight busy-loop if a caller ever
+  // passes timeout_ms < 0 while throttling is active.
+  bool throttle = !m_high_priority_queue.is_empty() &&
+                  m_worker_thread_count.load(std::memory_order_acquire) >=
+                      static_cast<int>(Thread_pool::s_oversubscribe_par);
+
+  int effective_timeout = throttle ? 1 : timeout_ms;
+
+  if (m_low_priority_queue.dequeue(event, effective_timeout)) {
     m_dequeue_count.fetch_add(1, std::memory_order_relaxed);
+    // queue_enter_time is intentionally NOT cleared here.
+    // It persists across dequeue→ACTIVE→IDLE→enqueue cycles so that
+    // determine_high_priority() can measure cumulative starvation time
+    // and trigger aging promotion.  It is only cleared when aging fires
+    // or when the connection is promoted via tickets.
     return true;
   }
+
+  return false;
+}
+
+bool Thread_group::determine_high_priority(Scheduler_data *sd, THD *thd) {
+  ulonglong now = my_micro_time();
+
+  // 1. Aging check: if this connection has been cycling through the low
+  //    priority queue for longer than prio_kickup_timer, promote it now.
+  //    queue_enter_time persists across multiple IDLE→LOW→ACTIVE→IDLE
+  //    cycles so connections aren't starved indefinitely.
+  if (sd->queue_enter_time > 0 && Thread_pool::s_prio_kickup_timer > 0) {
+    ulonglong waited = now - sd->queue_enter_time;
+    if (waited > Thread_pool::s_prio_kickup_timer * 1000ULL) {
+      sd->queue_enter_time = 0;
+      return true;
+    }
+  }
+
+  // 2. Check high priority mode.
+  uint mode = Thread_pool::s_high_prio_mode;
+  if (mode == Thread_pool::HIGH_PRIO_MODE_NONE) return false;
+
+  // 3. Tickets exhausted for this connection.
+  if (sd->high_prio_tickets == 0) return false;
+
+  // 4. Mode-specific checks.
+  if (mode == Thread_pool::HIGH_PRIO_MODE_STATEMENTS) {
+    sd->high_prio_tickets--;
+    sd->queue_enter_time = 0;
+    return true;
+  }
+
+  // mode == HIGH_PRIO_MODE_TRANSACTIONS: only boost if the connection
+  // holds an active transaction.  This avoids inflating the high priority
+  // queue with idle connections that happen to still have tickets.
+  if (thd != nullptr && thd_is_transaction_active(thd)) {
+    sd->high_prio_tickets--;
+    sd->queue_enter_time = 0;
+    return true;
+  }
+
+  // Future extension: connections holding MDL, table, global, or user locks
+  // could also be promoted to high priority here to reduce lock wait chains.
+  // This would require adding an API to thread_pool_priv.h, e.g.:
+  //   bool thd_holds_blocking_lock(THD *thd);
+  // The API would internally check THD::mdl_context for granted locks that
+  // block other waiters.  The benefit is that lock holders complete faster,
+  // reducing the length of blocking chains.  The risk is that a connection
+  // holding many locks could consume disproportionate scheduler time, so
+  // it should still be gated by high_prio_tickets.
 
   return false;
 }
@@ -340,6 +441,7 @@ void Thread_group::worker_main() {
       // Authentication succeeded.
       sd->group = this;
       add_connection_to_list(sd);
+      sd->high_prio_tickets = Thread_pool::s_high_prio_tickets;
 
       if (thd_connection_has_data(thd)) {
         sd->state.store(CS_ACTIVE, std::memory_order_release);

@@ -109,6 +109,10 @@ class Thread_group {
   bool check_stall();
 
  private:
+  // Determine whether a READY_CONNECTION event should go to the high
+  // priority queue, based on high_prio_mode, tickets, and aging.
+  bool determine_high_priority(Scheduler_data *sd, THD *thd);
+
   // Helper: create a pool worker thread using the OS.
   static void *worker_main_cdecl(void *arg);
   // Helper: create a listener thread using the OS.
