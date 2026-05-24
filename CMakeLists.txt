@@ -2354,6 +2354,7 @@ IF(NOT WITHOUT_SERVER AND WITH_UNIT_TESTS)
   IF(WITH_SHARED_UNITTEST_LIBRARY)
     MERGE_LIBRARIES_SHARED(server_unittest_library SKIP_INSTALL LINK_PUBLIC
       sql_main
+      threadpool
       ${MYSQLD_STATIC_PLUGIN_LIBS}
       minchassis
       ext::icu
@@ -2417,6 +2418,7 @@ IF(NOT WITHOUT_SERVER AND WITH_UNIT_TESTS)
     TARGET_LINK_LIBRARIES(server_unittest_library minchassis)
     TARGET_LINK_LIBRARIES(server_unittest_library ext::icu)
     TARGET_LINK_LIBRARIES(server_unittest_library binlog)
+    TARGET_LINK_LIBRARIES(server_unittest_library threadpool)
   ENDIF()
 ENDIF()
 

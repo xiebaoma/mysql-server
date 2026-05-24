@@ -787,6 +787,7 @@ MySQL clients support the protocol:
 #include "sql/conn_handler/connection_handler_impl.h"  // Per_thread_connection_handler
 #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
 #include "sql/conn_handler/socket_connection.h"  // stmt_info_new_packet
+#include "sql/threadpool/thread_pool.h"
 #include "sql/current_thd.h"                     // current_thd
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/debug_sync.h"  // debug_sync_end
@@ -2361,6 +2362,11 @@ static void close_connections(void) {
   (void)RUN_HOOK(server_state, before_server_shutdown, (nullptr));
 
   Per_thread_connection_handler::kill_blocked_pthreads();
+
+  // Thread pool: wake workers and start draining queues before we
+  // wait for connection_count to reach zero.  Workers will see the
+  // shutdown flag, drain any queued events, and exit.
+  Thread_pool::prepare_shutdown();
 
   uint dump_thread_count = 0;
   uint dump_thread_kill_retries = 8;
@@ -8280,9 +8286,14 @@ static int init_server_components() {
   delete_optimizer_cost_module();
 
   LEX_CSTRING plugin_name = {STRING_WITH_LEN("thread_pool")};
-  if (Connection_handler_manager::thread_handling !=
-          Connection_handler_manager::SCHEDULER_ONE_THREAD_PER_CONNECTION ||
-      plugin_is_ready(plugin_name, MYSQL_DAEMON_PLUGIN)) {
+  if (Connection_handler_manager::thread_handling ==
+          Connection_handler_manager::SCHEDULER_THREAD_POOL) {
+    auto res_grp_mgr = resourcegroups::Resource_group_mgr::instance();
+    res_grp_mgr->disable_resource_group();
+    res_grp_mgr->set_unsupport_reason("Thread pool enabled");
+  } else if (Connection_handler_manager::thread_handling !=
+                 Connection_handler_manager::SCHEDULER_ONE_THREAD_PER_CONNECTION ||
+             plugin_is_ready(plugin_name, MYSQL_DAEMON_PLUGIN)) {
     auto res_grp_mgr = resourcegroups::Resource_group_mgr::instance();
     res_grp_mgr->disable_resource_group();
     res_grp_mgr->set_unsupport_reason("Thread pool plugin enabled");
